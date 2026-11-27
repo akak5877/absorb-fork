@@ -108,6 +108,14 @@ mixin _StateMixin on ChangeNotifier {
   final Map<String, double> _localProgressOverrides = {};
   final Set<String> _resetItems = {};
 
+  /// Guards around the two "pull progress" paths. Both walk every book and
+  /// then notify every listener, so a tab switch used to stampede them.
+  bool _localProgressRefreshInFlight = false;
+  DateTime? _localProgressRefreshedAt;
+  int _localProgressSignature = 0;
+  bool _progressOnlyInFlight = false;
+  DateTime? _progressOnlyRefreshedAt;
+
   Set<String> _manualAbsorbAdds = {};
   Set<String> _finishedManualAbsorbAdds = {};
   Set<String> _manualAbsorbRemoves = {};

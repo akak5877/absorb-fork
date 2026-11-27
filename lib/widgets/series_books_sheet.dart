@@ -1154,7 +1154,7 @@ class _SeriesBooksSheetState extends State<SeriesBooksSheet> {
       final ctx = rootNavigatorKey.currentContext;
       if (ctx != null) showErrorToast(ctx, error);
     }
-    lib.refreshLocalProgress();
+    lib.refreshLocalProgress(force: true);
   }
 
   /// The series actions as a row of pills under the header, in place of

@@ -9,6 +9,7 @@ import '../services/cover_cache.dart';
 import '../providers/library_provider.dart';
 import '../services/audio_player_service.dart';
 import '../services/screen_wake.dart';
+import '../fork_config.dart';
 import '../services/volume_key_service.dart';
 import '../services/chromecast_service.dart';
 import '../services/home_widget_service.dart';
@@ -20,6 +21,7 @@ import '../utils/cover_accent.dart';
 import '../main.dart'
     show snappyTransitionsNotifier, einkModeNotifier, coverSchemeNotifier, rootNavigatorKey, applyOrientationLock, applyEinkModeTheme;
 import '../services/scoped_prefs.dart';
+import '../services/device_profile.dart';
 import 'dart:convert';
 import 'admin_screen.dart';
 import 'admin_api_keys_screen.dart';
@@ -248,7 +250,12 @@ class _AppShellState extends State<AppShell>
     }
     _ensurePageBuilt(index);
     _syncNavBarListener(index);
-    if (snappyTransitionsNotifier.value || einkModeNotifier.value) {
+    // Budget phones cannot afford a full-screen fade: it forces the whole
+    // page through an offscreen layer for 200 ms on every tab change. They
+    // get the same instant swap the e-ink / snappy settings already use.
+    if (snappyTransitionsNotifier.value ||
+        einkModeNotifier.value ||
+        DeviceProfile.lowRam) {
       setState(() => _currentIndex = index);
       _syncPlayerOnScreen();
     } else {
@@ -475,7 +482,10 @@ class _AppShellState extends State<AppShell>
   static const _isGithubBuild = bool.fromEnvironment('GITHUB_BUILD');
 
   void _checkForUpdate() async {
-    if (!_isGithubBuild) return;
+    // A configured fork publishes its own releases, so it checks them even
+    // when the build did not pass the upstream GITHUB_BUILD define.
+    if (!_isGithubBuild && !kForkConfigured) return;
+    if (!Platform.isAndroid) return;
     final includePreReleases = await PlayerSettings.getIncludePreReleases();
     final info = await UpdateCheckerService.check(
       includePreReleases: includePreReleases,
@@ -486,6 +496,7 @@ class _AppShellState extends State<AppShell>
 
   @override
   void dispose() {
+    _tabRefreshTimer?.cancel();
     _fadeController.dispose();
     _detachNavBarListener();
     _navBarAnimController.dispose();
@@ -545,7 +556,12 @@ class _AppShellState extends State<AppShell>
     }
 
     final brightness = Theme.of(context).brightness;
-    PaletteGenerator.fromImageProvider(provider, maximumColorCount: 16)
+    // Quantising a full-size cover is pure CPU on the UI isolate and runs
+    // every time the playing book changes (including the first frame after
+    // launch). 128 px is plenty for a 16-colour palette and an order of
+    // magnitude cheaper to decode and scan.
+    PaletteGenerator.fromImageProvider(ResizeImage(provider, width: 128),
+            maximumColorCount: 16)
         .then((palette) {
           final seedColor = accentFromCoverPalette(palette);
           if (seedColor == null) {
@@ -744,16 +760,52 @@ class _AppShellState extends State<AppShell>
   DateTime? _lastRefresh;
   static const _refreshCooldown = Duration(minutes: 1);
 
+  // Tab switches used to kick off the local progress scan and a progress
+  // fetch in the same frame as the incoming tab's first build. Both walk the
+  // whole library and then notify every listener, so the new page was being
+  // built and rebuilt while the old one was still fading out - the "stutter
+  // when changing tabs" on slower phones. Now the work waits for the switch
+  // to settle and is rate-limited.
+  DateTime? _lastLocalProgressRefresh;
+  DateTime? _lastProgressOnlyRefresh;
+  bool _progressOnlyInFlight = false;
+  Timer? _tabRefreshTimer;
+
+  void _scheduleRefreshForTab(int page) {
+    _tabRefreshTimer?.cancel();
+    _tabRefreshTimer = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted || _currentIndex != page) return;
+      _refreshDataForTab(page);
+    });
+  }
+
   void _refreshDataForTab(int tabIndex) {
     final now = DateTime.now();
     final lib = context.read<LibraryProvider>();
 
-    // Always sync local progress (cheap, no network)
-    lib.refreshLocalProgress();
+    // Always sync local progress (cheap, no network) - but it is an await per
+    // book (prefs read + JSON decode), so not on every single tap.
+    if (_lastLocalProgressRefresh == null ||
+        now.difference(_lastLocalProgressRefresh!) >
+            const Duration(seconds: 8)) {
+      _lastLocalProgressRefresh = now;
+      lib.refreshLocalProgress();
+    }
 
     // Tabs that do not need full personalized shelf rebuilds.
     if (tabIndex == 1 || tabIndex == 2 || tabIndex == 3) {
-      unawaited(lib.refreshProgressOnly());
+      if (_progressOnlyInFlight) return;
+      final last = _lastProgressOnlyRefresh;
+      if (last != null && now.difference(last) < const Duration(minutes: 1)) {
+        return;
+      }
+      _lastProgressOnlyRefresh = now;
+      _progressOnlyInFlight = true;
+      unawaited(
+        lib.refreshProgressOnly().whenComplete(() {
+          _progressOnlyInFlight = false;
+        }),
+      );
       return;
     }
 
@@ -807,10 +859,18 @@ class _AppShellState extends State<AppShell>
           opacity: _fadeController,
           child: IndexedStack(
             index: _currentIndex,
-            children: List<Widget>.generate(
-              _pages.length,
-              (i) => _pages[i] ?? const SizedBox.shrink(),
-            ),
+            children: List<Widget>.generate(_pages.length, (i) {
+              final page = _pages[i];
+              if (page == null) return const SizedBox.shrink();
+              // Off-screen tabs keep their state, but they must not keep
+              // animating (spinners, pulsing play badges) or repainting while
+              // the user is elsewhere - that is frames stolen from the tab
+              // that is actually visible.
+              return TickerMode(
+                enabled: i == _currentIndex,
+                child: RepaintBoundary(child: page),
+              );
+            }),
           ),
         ),
         bottomNavigationBar: _buildBottomNav(context),
@@ -900,7 +960,7 @@ class _AppShellState extends State<AppShell>
             _navigateTo(page);
             // Refresh data on switching to Library, Home, Absorbing, or Stats
             if (page == 0 || page == 1 || page == 2 || page == 3) {
-              _refreshDataForTab(page);
+              _scheduleRefreshForTab(page);
             }
           },
           destinations: destinations,

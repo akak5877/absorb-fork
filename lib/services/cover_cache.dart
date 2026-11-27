@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import 'api_service.dart';
+import 'device_profile.dart';
 
 /// Persistent on-disk cache for book / author cover art.
 ///
@@ -46,6 +47,7 @@ class CoverCache {
   Timer? _indexSaveTimer;
   Timer? _prefetchTimer;
   bool _prefetchRunning = false;
+  bool _prefetchRemaining = false;
   ApiService? Function()? _apiResolver;
 
   // ── setup ────────────────────────────────────────────────────────────
@@ -264,6 +266,7 @@ class CoverCache {
     _prefetchRunning = true;
     try {
       final missing = <MapEntry<String, int?>>[];
+      var scanned = 0;
       for (final entry in ids.entries) {
         final url = api.getCoverUrl(
           entry.key,
@@ -271,8 +274,24 @@ class CoverCache {
           updatedAt: entry.value,
         );
         if (!isCached(url)) missing.add(entry);
+        // One `stat` each is cheap, but a thousand of them back to back on a
+        // budget phone's storage is a visible freeze. Hand the event loop a
+        // slice every so often so taps and scrolling stay responsive.
+        if (++scanned % 40 == 0) {
+          await Future<void>.delayed(Duration.zero);
+        }
       }
       if (missing.isEmpty) return;
+      // Warm a bounded slice per run instead of trying to fetch the entire
+      // library in one go; the rest continues on the next launch (or when a
+      // new item is remembered). On a low-RAM device keep both the slice and
+      // the concurrency small.
+      final perRunLimit = DeviceProfile.lowRam ? 60 : 240;
+      final hadMore = missing.length > perRunLimit;
+      _prefetchRemaining = hadMore;
+      if (hadMore) {
+        missing.removeRange(perRunLimit, missing.length);
+      }
       debugPrint('[CoverCache] warming ${missing.length} covers');
       var index = 0;
       Future<void> worker() async {
@@ -286,15 +305,30 @@ class CoverCache {
           try {
             await load(url);
           } catch (_) {}
+          // Same reasoning as the scan above: decoding the next image on the
+          // engine thread is fine, but never let the loop monopolise a
+          // microtask queue that the UI is waiting on.
+          await Future<void>.delayed(Duration.zero);
         }
       }
 
       await Future.wait(
-        List.generate(_maxPrefetchConcurrency, (_) => worker()),
+        List.generate(
+          DeviceProfile.lowRam ? 1 : _maxPrefetchConcurrency,
+          (_) => worker(),
+        ),
       );
       debugPrint('[CoverCache] warm-up done');
     } finally {
       _prefetchRunning = false;
+      // A capped run leaves the tail of a big library for later; come back
+      // once the device has been idle for a while rather than hammering it
+      // with hundreds of downloads in one burst.
+      if (_prefetchRemaining) {
+        _prefetchRemaining = false;
+        _prefetchTimer?.cancel();
+        _prefetchTimer = Timer(const Duration(seconds: 25), _pumpPrefetch);
+      }
     }
   }
 

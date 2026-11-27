@@ -73,7 +73,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // no define, so it falls through here.
   static String get _flavorLabel => _isDevBuild
       ? 'Dev'
-      : _isGithubBuild ? 'GitHub' : _isPlayStoreBuild ? 'Play Store' : 'F-Droid';
+      : _isGithubBuild || kForkConfigured
+          ? 'GitHub'
+          : _isPlayStoreBuild ? 'Play Store' : 'F-Droid';
+
+  /// True when this build can install an APK straight from the GitHub repo.
+  /// The Play Store build must not (the store forbids self-updating, and the
+  /// GitHub APK is signed with a different key anyway).
+  bool get _showsUpdateButton =>
+      Platform.isAndroid && !_isPlayStoreBuild && kForkConfigured;
+
+  /// Pre-release channel was previously only offered to the upstream CI build;
+  /// this fork is configured for its own repo, so it gets the same switch.
+  bool get _githubChannel => _isGithubBuild || kForkConfigured;
+
+  bool _checkingUpdate = false;
+
+  Future<void> _checkForUpdates() async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    try {
+      final info = await UpdateCheckerService.check(
+        force: true,
+        includePreReleases: _includePreReleases,
+      );
+      if (!mounted) return;
+      final l = AppLocalizations.of(context)!;
+      if (info == null || !info.hasUpdate) {
+        // Distinguish "GitHub says you are current" from "could not reach
+        // GitHub", otherwise a phone with no signal is told it is up to date.
+        final failed = UpdateCheckerService.lastCheckFailed;
+        showOverlayToast(
+          context,
+          failed ? l.stillOffline : l.onLatestVersion,
+          icon: failed
+              ? Icons.wifi_off_rounded
+              : Icons.check_circle_outline_rounded,
+        );
+        return;
+      }
+      await UpdateDialog.show(context, info);
+    } finally {
+      if (mounted) setState(() => _checkingUpdate = false);
+    }
+  }
 
   String _versionLine(AppLocalizations l) {
     final base = Platform.isIOS
@@ -262,7 +305,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localServerController = TextEditingController();
     _loadSettings();
     _loadBookRequests();
-    _loadAdminIssueCount();
+    // One HTTP request per library just to draw a badge. Opening Settings was
+    // firing those in the same frame as the page's first build, which is the
+    // most expensive build in the app; give it a moment to settle.
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      _badgeDelayDone = true;
+      if (mounted) _loadAdminIssueCount();
+    });
     _refreshSyncStatus();
     SocketService().addItemsChangedListener(_onServerItemsChanged);
     PlayerSettings.settingsChanged.addListener(_onExternalSettingsChange);
@@ -274,6 +323,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // the shell, so initState runs a single time per session).
   Timer? _issueBadgeDebounce;
   bool _issueCountFetched = false;
+  bool _badgeDelayDone = false;
 
   void _onServerItemsChanged() {
     if (!mounted || !context.read<AuthProvider>().isAdmin) return;
@@ -1613,11 +1663,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
     final auth = context.watch<AuthProvider>();
-    final lib = context.watch<LibraryProvider>();
+    // This page renders a handful of library fields, but watching the whole
+    // provider meant every progress-only notification - several per tab
+    // switch, and one per playback sync - rebuilt the entire settings tree.
+    // Rebuild only when what is actually on screen can change.
+    context.select<LibraryProvider, String>((lib) {
+      final ids = lib.libraries
+          .map((entry) => '${(entry as Map)['id']}:${entry['name']}')
+          .join('|');
+      return '$ids#${lib.selectedLibraryId}#${lib.syncQueueAutoDownloads}';
+    });
+    final lib = context.read<LibraryProvider>();
     final l = AppLocalizations.of(context)!;
     // Libraries may not have loaded yet when initState fetched the admin issue
     // badge; retry once they arrive.
-    if (!_issueCountFetched && auth.isAdmin && lib.libraries.isNotEmpty) {
+    if (_badgeDelayDone &&
+        !_issueCountFetched &&
+        auth.isAdmin &&
+        lib.libraries.isNotEmpty) {
       _issueCountFetched = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _loadAdminIssueCount();
@@ -4450,7 +4513,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         } : null,
                       ),
                     ],
-                    if (_isGithubBuild) ...[
+                    if (_githubChannel) ...[
                       const Divider(height: 1, indent: 16, endIndent: 16),
                       SwitchListTile(
                         title: Row(children: [
@@ -4504,37 +4567,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 16),
-
-                // ── Support the Dev ──
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Column(
-                    children: [
-                      Card(
-                        color: cs.surfaceContainerHigh,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14)),
-                        clipBehavior: Clip.antiAlias,
-                        child: ListTile(
-                          leading: Icon(Icons.coffee_rounded,
-                              color: Colors.amber.shade600),
-                          title: Text(l.supportTheDev),
-                          subtitle: Text(l.buyMeACoffee,
-                              style: tt.bodySmall
-                                  ?.copyWith(color: cs.onSurfaceVariant)),
-                          trailing: Icon(Icons.favorite_rounded,
-                              size: 18, color: Colors.amber.shade600),
-                          onTap: () => launchUrl(
-                              Uri.parse(
-                                  'https://www.buymeacoffee.com/BarnabasApps'),
-                              mode: LaunchMode.externalApplication),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
                 const SizedBox(height: 16),
 
                 // ── Backup and sync ──
@@ -4602,7 +4634,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                     const SizedBox(width: 4),
                     Icon(
-                      _isGithubBuild ? Icons.code_rounded : Icons.store_rounded,
+                      _githubChannel ? Icons.code_rounded : Icons.store_rounded,
                       size: 14,
                       color: cs.onSurfaceVariant.withValues(alpha: 0.3),
                     ),
@@ -4615,23 +4647,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                 )),
 
-                if (_isGithubBuild) ...[
-                  const SizedBox(height: 4),
-                  Center(child: TextButton.icon(
-                    onPressed: () async {
-                      final info = await UpdateCheckerService.check(force: true, includePreReleases: _includePreReleases);
-                      if (!mounted) return;
-                      if (info == null || !info.hasUpdate) {
-                        showOverlayToast(context, l.onLatestVersion,
-                            icon: Icons.check_circle_outline_rounded);
-                        return;
-                      }
-                      await UpdateDialog.show(context, info);
-                    },
-                    icon: const Icon(Icons.system_update_rounded, size: 16),
-                    label: Text(l.checkForUpdate),
-                  )),
+                if (_showsUpdateButton) ...[
+                  const SizedBox(height: 10),
+                  Center(
+                    child: SizedBox(
+                      height: 40,
+                      child: _checkingUpdate
+                          ? const Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 24),
+                              child: Center(
+                                child: SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                              ),
+                            )
+                          : FilledButton.tonalIcon(
+                              onPressed: _checkForUpdates,
+                              icon: const Icon(Icons.system_update_rounded, size: 18),
+                              label: Text(l.checkForUpdate),
+                              style: FilledButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(horizontal: 20),
+                              ),
+                            ),
+                    ),
+                  ),
                 ],
+
+                const SizedBox(height: 18),
+
+                // ── Support the Dev ──
+                // Kept at the very bottom: it is the least-used card on this
+                // page, and everything above it is something the listener may
+                // actually need to change.
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Card(
+                    color: cs.surfaceContainerHigh,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    clipBehavior: Clip.antiAlias,
+                    child: ListTile(
+                      leading: Icon(Icons.coffee_rounded,
+                          color: Colors.amber.shade600),
+                      title: Text(l.supportTheDev),
+                      subtitle: Text(l.buyMeACoffee,
+                          style: tt.bodySmall
+                              ?.copyWith(color: cs.onSurfaceVariant)),
+                      trailing: Icon(Icons.favorite_rounded,
+                          size: 18, color: Colors.amber.shade600),
+                      onTap: () => launchUrl(
+                          Uri.parse(
+                              'https://www.buymeacoffee.com/BarnabasApps'),
+                          mode: LaunchMode.externalApplication),
+                    ),
+                  ),
+                ),
 
                 const SizedBox(height: 100),
               ],

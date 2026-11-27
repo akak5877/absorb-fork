@@ -448,7 +448,7 @@ class _AbsorbingScreenState extends State<AbsorbingScreen> {
       await _player.pause();
       await _player.stop();
     }
-    lib.refreshLocalProgress();
+    lib.refreshLocalProgress(force: true);
     await lib.refresh();
     if (mounted) setState(() => _isSyncing = false);
   }

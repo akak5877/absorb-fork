@@ -44,6 +44,7 @@ import 'services/wording.dart';
 import 'screens/login_screen.dart';
 import 'screens/app_shell.dart';
 import 'services/cover_cache.dart';
+import 'services/device_profile.dart';
 import 'widgets/auth_loading_screen.dart';
 import 'widgets/setup_link_login.dart';
 
@@ -687,6 +688,9 @@ class _AuthGateState extends State<AuthGate> {
         ApiService.deviceManufacturer = info.manufacturer;
         ApiService.deviceModel = info.model;
         ApiService.deviceSdkInt = info.version.sdkInt;
+        // Same platform call we already make, so sizing the image cache and
+        // the cover prefetch for this device costs nothing extra.
+        DeviceProfile.applyAndroidInfo(info);
       } else if (Platform.isIOS) {
         final info = await DeviceInfoPlugin().iosInfo;
         ApiService.deviceManufacturer = 'Apple';

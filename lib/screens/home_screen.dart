@@ -201,7 +201,13 @@ class HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMi
     Future.microtask(() {
       final lib = context.read<LibraryProvider>();
       if (lib.libraries.isEmpty) lib.loadLibraries();
-      lib.refreshLocalProgress();
+      // The local-progress merge walks every book (one prefs read + JSON
+      // decode each). On a big library that is real work, so give the first
+      // frame of the launch priority over it instead of running it in the
+      // same microtask that builds the shelf.
+      Future.delayed(const Duration(milliseconds: 600), () {
+        if (mounted) lib.refreshLocalProgress();
+      });
     });
     // Tell AppShell we're alive so its bottom-nav listener can attach now
     // rather than waiting on a postFrame retry that may never re-fire.
@@ -964,7 +970,8 @@ class _ContinueListeningCardState extends State<_ContinueListeningCard> {
     } else {
       provider = CachedNetworkImageProvider(coverUrl, headers: widget.lib.mediaHeaders);
     }
-    PaletteGenerator.fromImageProvider(provider, maximumColorCount: 16)
+    PaletteGenerator.fromImageProvider(ResizeImage(provider, width: 128),
+            maximumColorCount: 16)
         .then((palette) {
           final picked = accentFromCoverPalette(palette);
           if (picked == null) return;

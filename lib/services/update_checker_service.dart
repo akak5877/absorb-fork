@@ -75,11 +75,17 @@ class UpdateCheckerService {
   /// Check for updates. Returns UpdateInfo if a newer version exists, null otherwise.
   /// Respects a 12-hour cooldown between checks and skips dismissed versions.
   /// When [includePreReleases] is true, pre-release/alpha builds are also considered.
+  /// True when the last [check] could not reach GitHub (offline, rate limited,
+  /// unexpected status). Lets the UI tell "you are up to date" apart from
+  /// "could not ask", so a phone with no signal is not told it is current.
+  static bool lastCheckFailed = false;
+
   static Future<UpdateInfo?> check({bool force = false, bool includePreReleases = false}) async {
     // A fork with its own signature must never be pointed at the upstream
     // releases: installing one of those APKs over this build fails, and
     // advertising it would be wrong. Self-updates resume once the fork's
     // repository is configured in lib/fork_config.dart.
+    lastCheckFailed = false;
     if (_repo.isEmpty) return null;
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -101,7 +107,11 @@ class UpdateCheckerService {
           Uri.parse('https://api.github.com/repos/$_repo/releases?per_page=5'),
           headers: {'Accept': 'application/vnd.github.v3+json'},
         ).timeout(const Duration(seconds: 10));
-        if (response.statusCode != 200) return null;
+        if (response.statusCode == 404) return null; // repository has no releases yet
+        if (response.statusCode != 200) {
+          lastCheckFailed = true;
+          return null;
+        }
         final releases = jsonDecode(response.body) as List<dynamic>;
         if (releases.isEmpty) return null;
         data = releases.first as Map<String, dynamic>;
@@ -110,7 +120,11 @@ class UpdateCheckerService {
           Uri.parse('https://api.github.com/repos/$_repo/releases/latest'),
           headers: {'Accept': 'application/vnd.github.v3+json'},
         ).timeout(const Duration(seconds: 10));
-        if (response.statusCode != 200) return null;
+        if (response.statusCode == 404) return null; // no published release yet
+        if (response.statusCode != 200) {
+          lastCheckFailed = true;
+          return null;
+        }
         data = jsonDecode(response.body) as Map<String, dynamic>;
       }
 
@@ -175,6 +189,7 @@ class UpdateCheckerService {
 
       return info;
     } catch (e) {
+      lastCheckFailed = true;
       debugPrint('[UpdateChecker] Error: $e');
       return null;
     }

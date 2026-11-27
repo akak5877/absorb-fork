@@ -893,30 +893,65 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
         (_pendingUnfinishedDeltas[showId] ?? 0) + delta;
   }
 
-  Future<void> refreshLocalProgress() async {
-    final sync = ProgressSyncService();
-    final itemIds = <String>{..._progressMap.keys};
-    for (final dl in DownloadService().downloadedItems) {
-      itemIds.add(dl.itemId);
+  /// Folds locally stored positions into the overrides the shelves paint from.
+  ///
+  /// [force] bypasses the rate limit; pass it right after an edit that has to
+  /// show up immediately. Repeated calls (tab switches, screen inits) are
+  /// dropped for a few seconds: the scan awaits one prefs read + JSON decode
+  /// per book, and on a slow phone a large library made that alone drop a
+  /// frame every time the user changed tabs.
+  Future<void> refreshLocalProgress({bool force = false}) async {
+    if (_localProgressRefreshInFlight) return;
+    final last = _localProgressRefreshedAt;
+    if (!force &&
+        last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 6)) {
+      return;
     }
-    for (final itemId in itemIds) {
-      if (_locallyFinishedItems.contains(itemId)) continue;
-      if (_resetItems.contains(itemId)) continue;
-      final serverFinished = _progressMap[itemId]?['isFinished'] == true;
-      final data = await sync.getLocal(itemId);
-      if (data != null) {
-        final currentTime = (data['currentTime'] as num?)?.toDouble() ?? 0;
-        final duration = (data['duration'] as num?)?.toDouble() ?? 0;
-        if (duration > 0) {
-          final progress = (currentTime / duration).clamp(0.0, 1.0);
-          if (progress >= 0.99 && !serverFinished) continue;
-          if (serverFinished) continue;
-          _localProgressOverrides[itemId] = progress;
-          if (currentTime > 0) _resetItems.remove(itemId);
+    _localProgressRefreshInFlight = true;
+    try {
+      final sync = ProgressSyncService();
+      final itemIds = <String>{..._progressMap.keys};
+      for (final dl in DownloadService().downloadedItems) {
+        itemIds.add(dl.itemId);
+      }
+      for (final itemId in itemIds) {
+        if (_locallyFinishedItems.contains(itemId)) continue;
+        if (_resetItems.contains(itemId)) continue;
+        final serverFinished = _progressMap[itemId]?['isFinished'] == true;
+        final data = await sync.getLocal(itemId);
+        if (data != null) {
+          final currentTime = (data['currentTime'] as num?)?.toDouble() ?? 0;
+          final duration = (data['duration'] as num?)?.toDouble() ?? 0;
+          if (duration > 0) {
+            final progress = (currentTime / duration).clamp(0.0, 1.0);
+            if (progress >= 0.99 && !serverFinished) continue;
+            if (serverFinished) continue;
+            _localProgressOverrides[itemId] = progress;
+            if (currentTime > 0) _resetItems.remove(itemId);
+          }
         }
       }
+      // Only repaint the shelves when an override actually moved. The scan
+      // runs every few seconds during playback and used to notify regardless.
+      final signature = _computeLocalProgressSignature();
+      if (signature != _localProgressSignature) {
+        _localProgressSignature = signature;
+        notifyListeners();
+      }
+    } finally {
+      _localProgressRefreshInFlight = false;
+      _localProgressRefreshedAt = DateTime.now();
     }
-    notifyListeners();
+  }
+
+  int _computeLocalProgressSignature() {
+    var hash = 17;
+    for (final entry in _localProgressOverrides.entries) {
+      hash = 31 * hash + entry.key.hashCode;
+      hash = 31 * hash + (entry.value * 10000).round();
+    }
+    return hash;
   }
 
   void clearProgressFor(String itemId) {

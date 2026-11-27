@@ -748,7 +748,8 @@ class _BookDetailSheetContentState extends State<_BookDetailSheetContent> {
     }
     final t0 = DateTime.now();
     debugPrint('[BookDetail] _deriveCoverScheme start url=$url');
-    PaletteGenerator.fromImageProvider(provider, maximumColorCount: 16)
+    PaletteGenerator.fromImageProvider(ResizeImage(provider, width: 128),
+            maximumColorCount: 16)
         .then((palette) {
       debugPrint('[BookDetail] PaletteGenerator ok in ${DateTime.now().difference(t0).inMilliseconds}ms');
       final seedColor = accentFromCoverPalette(palette);
@@ -3718,7 +3719,7 @@ class _BookDetailSheetContentState extends State<_BookDetailSheetContent> {
       unawaited(lib.rememberStartedInAbsorbing(widget.itemId, _item));
       unawaited(lib.syncQueueAutoDownloads());
     }
-    lib.refreshLocalProgress();
+    lib.refreshLocalProgress(force: true);
     lib.refresh();
   }
 

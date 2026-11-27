@@ -242,7 +242,7 @@ class LibraryProvider extends ChangeNotifier
           _buildOfflineSections();
           _isLoading = false;
           notifyListeners();
-          refreshLocalProgress();
+          refreshLocalProgress(force: true);
           if (_deviceHasConnectivity) _startServerPingTimer();
           _completeAccountLoad(accountLoadGeneration);
           return;
@@ -318,7 +318,7 @@ class LibraryProvider extends ChangeNotifier
         _buildOfflineSections();
         _isLoading = false;
         notifyListeners();
-        refreshLocalProgress();
+        refreshLocalProgress(force: true);
       }();
       notifyListeners();
     } else {
@@ -588,11 +588,43 @@ class LibraryProvider extends ChangeNotifier
     notifyListeners();
   }
 
-  Future<void> refreshProgressOnly() async {
+  Future<void> refreshProgressOnly({bool force = false}) async {
     if (isOffline || _api == null) return;
-    await ProgressSyncService().flushPendingSync(api: _api!);
-    await _refreshProgress();
-    notifyListeners();
+    if (_progressOnlyInFlight) return;
+    final last = _progressOnlyRefreshedAt;
+    if (!force &&
+        last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 20)) {
+      return;
+    }
+    _progressOnlyInFlight = true;
+    final before = _progressSignature();
+    try {
+      await ProgressSyncService().flushPendingSync(api: _api!);
+      await _refreshProgress();
+      // A pull that changed nothing must not rebuild Home, Library and
+      // Settings - that used to happen on almost every tab tap.
+      if (_progressSignature() != before) notifyListeners();
+    } finally {
+      _progressOnlyInFlight = false;
+      _progressOnlyRefreshedAt = DateTime.now();
+    }
+  }
+
+  int _progressSignature() {
+    var hash = 7;
+    for (final entry in _progressMap.entries) {
+      hash = 31 * hash + entry.key.hashCode;
+      hash = 31 * hash +
+          ((entry.value['currentTime'] as num?)?.toInt() ?? 0);
+      hash = 31 * hash + (entry.value['isFinished'] == true ? 1 : 0);
+      hash = 31 * hash +
+          (((entry.value['ebookProgress'] as num?)?.toDouble() ?? -1) * 1000)
+              .round();
+    }
+    hash = 31 * hash + _localProgressOverrides.length;
+    hash = 31 * hash + _locallyFinishedItems.length;
+    return hash;
   }
 
   Future<void> loadSeries({String sort = 'addedAt', int desc = 1}) async {

@@ -1,5 +1,6 @@
 import 'dart:io' show Platform;
 import 'package:flutter/widgets.dart';
+import '../fork_config.dart';
 import '../l10n/app_localizations.dart';
 import '../services/wording.dart';
 
@@ -157,7 +158,7 @@ List<SettingSearchEntry> settingsSearchEntries(BuildContext context) {
     SettingSearchEntry('Advanced', l.sectionAdvanced, l.trustAllCertificates, [l.trustAllCertificatesOnSubtitle, l.trustAllCertificatesOffSubtitle]),
     if (Platform.isAndroid)
       SettingSearchEntry('Advanced', l.sectionAdvanced, l.mp3IndexSeeking, [l.mp3IndexSeekingOnSubtitle, l.mp3IndexSeekingOffSubtitle]),
-    if (const bool.fromEnvironment('GITHUB_BUILD'))
+    if (const bool.fromEnvironment('GITHUB_BUILD') || kForkConfigured)
       SettingSearchEntry('Advanced', l.sectionAdvanced, l.includePreReleases, [l.includePreReleasesOnSubtitle, l.includePreReleasesOffSubtitle]),
     SettingSearchEntry('Advanced', l.sectionAdvanced, l.adminRmab, [l.adminRmabConnected, l.adminRmabAskAdmin]),
     SettingSearchEntry('Advanced', l.sectionAdvanced, l.transcriptionTitle, [l.transcriptionAdvancedSubtitle, l.syncReadingListening]),
