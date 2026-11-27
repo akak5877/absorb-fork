@@ -3,7 +3,7 @@
 /// This app is a modified fork of Absorb (https://github.com/pounat/absorb,
 /// GPL-3.0-or-later). Set [kForkRepo] to your own GitHub repository before
 /// publishing; it drives the in-app updater and the "report an issue" link.
-const String kForkRepo = 'YOUR_GITHUB_USER/absorb-fork';
+const String kForkRepo = 'akak5877/absorb-fork';
 
 const String kUpstreamRepo = 'pounat/absorb';
 
