@@ -4619,7 +4619,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
 
+                const SizedBox(height: 16),
+
+                // ── Support the Dev ──
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Card(
+                    color: cs.surfaceContainerHigh,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    clipBehavior: Clip.antiAlias,
+                    child: ListTile(
+                      leading: Icon(Icons.coffee_rounded,
+                          color: Colors.amber.shade600),
+                      title: Text(l.supportTheDev),
+                      subtitle: Text(l.buyMeACoffee,
+                          style: tt.bodySmall
+                              ?.copyWith(color: cs.onSurfaceVariant)),
+                      trailing: Icon(Icons.favorite_rounded,
+                          size: 18, color: Colors.amber.shade600),
+                      onTap: () => launchUrl(
+                          Uri.parse(
+                              'https://www.buymeacoffee.com/BarnabasApps'),
+                          mode: LaunchMode.externalApplication),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 18),
+
                 // ── Version Info ──
+                // Version and the update action sit at the very bottom: they
+                // are reference/one-off items, so everything the listener
+                // might actually come here to change stays above them.
                 Center(child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -4674,36 +4706,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ),
                 ],
-
-                const SizedBox(height: 18),
-
-                // ── Support the Dev ──
-                // Kept at the very bottom: it is the least-used card on this
-                // page, and everything above it is something the listener may
-                // actually need to change.
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Card(
-                    color: cs.surfaceContainerHigh,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
-                    clipBehavior: Clip.antiAlias,
-                    child: ListTile(
-                      leading: Icon(Icons.coffee_rounded,
-                          color: Colors.amber.shade600),
-                      title: Text(l.supportTheDev),
-                      subtitle: Text(l.buyMeACoffee,
-                          style: tt.bodySmall
-                              ?.copyWith(color: cs.onSurfaceVariant)),
-                      trailing: Icon(Icons.favorite_rounded,
-                          size: 18, color: Colors.amber.shade600),
-                      onTap: () => launchUrl(
-                          Uri.parse(
-                              'https://www.buymeacoffee.com/BarnabasApps'),
-                          mode: LaunchMode.externalApplication),
-                    ),
-                  ),
-                ),
 
                 const SizedBox(height: 100),
               ],
