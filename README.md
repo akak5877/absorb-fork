@@ -148,11 +148,11 @@ your own build, otherwise updates and bug reports point at the wrong repo.
 
 ### Publishing a release
 
-1. Tag the build: `git tag -a v1.12.1+310 -m "Absorb Fork 1.12.1"` then
-   `git push origin "v1.12.1+310"`.
+1. Tag the build: `git tag -a v1.12.2+311 -m "Absorb Fork 1.12.2"` then
+   `git push origin "v1.12.2+311"`.
 2. On GitHub: **Releases → Draft a new release**, pick that tag.
 3. Attach the APK renamed to `absorb-<version>-<build>-<abi>.apk`
-   (here: `absorb-1.12.1-310-arm64-v8a.apk`). The in-app updater matches the ABI
+   (here: `absorb-1.12.2-311-arm64-v8a.apk`). The in-app updater matches the ABI
    token in the file name, so the name matters — an APK named just `...-arm64.apk`
    only works because it is the single asset in the release.
 

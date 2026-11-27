@@ -1,7 +1,7 @@
 name: absorb
 description: An Audiobookshelf Client
 publish_to: 'none'
-version: 1.12.1+310
+version: 1.12.2+311
 
 environment:
   sdk: '>=3.10.0 <4.0.0'
@@ -164,8 +164,9 @@ flutter_launcher_icons:
   ios: true
   remove_alpha_ios: true
   image_path: "assets/icon/app_icon.png"
-  adaptive_icon_background: "#000000"
+  adaptive_icon_background: "#FDB15F"
   adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  adaptive_icon_foreground_inset: 0
 
 flutter_native_splash:
   color: "#000000"
