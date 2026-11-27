@@ -1,0 +1,589 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../l10n/app_localizations.dart';
+import 'cover_badges.dart';
+import '../services/ebook_cache.dart';
+import '../providers/library_provider.dart';
+import '../services/audio_player_service.dart';
+import '../services/download_service.dart';
+import 'absorbing_shared.dart';
+import 'cover_image.dart';
+import 'book_detail_sheet.dart';
+import 'episode_list_sheet.dart';
+
+class BookCard extends StatelessWidget {
+  final Map<String, dynamic> item;
+  final bool showProgress;
+  final bool showSubtitle;
+  final bool isWide;
+  final double coverAspectRatio;
+  final String? sourcePlaylistId;
+  final String? sourcePlaylistEpisodeId;
+  final String? sourceCollectionId;
+  final String? sourceCollectionName;
+  final bool selectionMode;
+  final bool selected;
+  final VoidCallback? onSelectionToggle;
+
+  const BookCard({
+    super.key,
+    required this.item,
+    this.showProgress = false,
+    this.showSubtitle = false,
+    this.isWide = false,
+    this.coverAspectRatio = 1.0,
+    this.sourcePlaylistId,
+    this.sourcePlaylistEpisodeId,
+    this.sourceCollectionId,
+    this.sourceCollectionName,
+    this.selectionMode = false,
+    this.selected = false,
+    this.onSelectionToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.watch<LibraryProvider>();
+
+    final itemId = item['id'] as String?;
+    final media = item['media'] as Map<String, dynamic>? ?? {};
+    final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+
+    final title = metadata['title'] as String? ?? l.bookCardUnknownTitle;
+    final subtitle = metadata['subtitle'] as String? ?? '';
+    final authorName = metadata['authorName'] as String? ?? '';
+    final coverUrl = lib.getCoverUrl(itemId);
+
+    // Progress from LibraryProvider (fetched via /api/me, same source as book detail)
+    final progress = lib.getProgress(itemId);
+    final isFinished = lib.getProgressData(itemId)?['isFinished'] == true;
+    final isSkimmed = lib.getProgressData(itemId)?['skimmed'] == true;
+    final isExplicit = PlayerSettings.showExplicitBadge && metadata['explicit'] == true;
+    final isDownloaded = DownloadService().isDownloaded(itemId ?? '');
+    final hasEbook = PlayerSettings.showEbookBadge && hasEbookFile(item);
+    // Only compute for podcast shows that aren't being rendered as an episode
+    // (an episode card shows the recentEpisode payload, not show-level info).
+    final unfinishedCount = (lib.isPodcastLibrary && item['recentEpisode'] == null)
+        ? lib.getUnfinishedEpisodeCount(item)
+        : 0;
+
+    final headers = lib.mediaHeaders;
+
+    final card = isWide
+        ? _buildWideCard(context, cs, tt, l, title, authorName, coverUrl, progress, headers, isExplicit: isExplicit, hasEbook: hasEbook)
+        : _buildCompactCard(context, cs, tt, l, title, subtitle, authorName, coverUrl, progress, headers, isFinished: isFinished, isSkimmed: isSkimmed, isDownloaded: isDownloaded, isExplicit: isExplicit, unfinishedCount: unfinishedCount, hasEbook: hasEbook);
+    if (!selectionMode) return card;
+    // Selection sits on top of the finished card rather than inside both
+    // layouts: the overlay swallows the tap, so nothing below it can open a
+    // sheet while the shelf is being ticked through.
+    return Stack(
+      children: [
+        card,
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: onSelectionToggle,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: selected
+                    ? Border.all(color: cs.primary, width: 3)
+                    : null,
+                color: selected
+                    ? cs.primary.withValues(alpha: 0.18)
+                    : Colors.transparent,
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          top: 6,
+          left: 6,
+          child: IgnorePointer(
+            child: Container(
+              width: 26,
+              height: 26,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: selected
+                    ? cs.primary
+                    : Colors.black.withValues(alpha: 0.55),
+                border: Border.all(
+                  color: selected ? cs.primary : Colors.white70,
+                ),
+              ),
+              child: Icon(
+                selected ? Icons.check_rounded : Icons.circle_outlined,
+                size: 17,
+                color: selected ? cs.onPrimary : Colors.white70,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _navigateToDetail(BuildContext context) {
+    final itemId = item['id'] as String?;
+    if (itemId == null) return;
+    final lib = context.read<LibraryProvider>();
+    if (lib.isPodcastLibrary) {
+      final episode = item['recentEpisode'] as Map<String, dynamic>?;
+      if (episode != null) {
+        EpisodeDetailSheet.show(
+          context,
+          item,
+          episode,
+          sourcePlaylistId: sourcePlaylistId,
+        );
+      } else {
+        EpisodeListSheet.show(
+          context,
+          item,
+          sourcePlaylistId: sourcePlaylistId,
+          sourcePlaylistEpisodeId: sourcePlaylistEpisodeId,
+        );
+      }
+    } else {
+      showBookDetailSheet(
+        context,
+        itemId,
+        sourcePlaylistId: sourcePlaylistId,
+        sourceCollectionId: sourceCollectionId,
+        sourceCollectionName: sourceCollectionName,
+      );
+    }
+  }
+
+  /// Long-press shortcut to the quick-actions sheet (podcasts skipped — they
+  /// keep the normal open-details behaviour).
+  void _onLongPress(BuildContext context) {
+    final itemId = item['id'] as String?;
+    if (itemId == null) return;
+    if (context.read<LibraryProvider>().isPodcastLibrary) {
+      // Episode card -> episode quick sheet; show cover -> keep current behaviour.
+      final episode = item['recentEpisode'] as Map<String, dynamic>?;
+      if (episode != null) {
+        EpisodeDetailSheet.showQuick(
+          context,
+          item,
+          episode,
+          sourcePlaylistId: sourcePlaylistId,
+        );
+      } else {
+        _navigateToDetail(context);
+      }
+      return;
+    }
+    showQuickActionsSheet(
+      context,
+      itemId,
+      initialItem: item,
+      sourcePlaylistId: sourcePlaylistId,
+      sourceCollectionId: sourceCollectionId,
+      sourceCollectionName: sourceCollectionName,
+    );
+  }
+
+  /// Wide "continue listening" card with square cover + text side-by-side.
+  /// Uses IntrinsicHeight so the row sizes to the square cover without overflow.
+  Widget _buildWideCard(
+    BuildContext context,
+    ColorScheme cs,
+    TextTheme tt,
+    AppLocalizations l,
+    String title,
+    String authorName,
+    String? coverUrl,
+    double progress,
+    Map<String, String> headers, {
+    bool isExplicit = false,
+    bool hasEbook = false,
+  }) {
+    return Card(
+      elevation: 0,
+      color: cs.surfaceContainerHigh,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => _navigateToDetail(context),
+        onLongPress: () => _onLongPress(context),
+        borderRadius: BorderRadius.circular(16),
+        child: Row(
+          children: [
+            // Square cover with download badge
+            SizedBox(
+              width: 120,
+              height: 120,
+              child: Stack(
+                children: [
+                  _CoverImage(coverUrl: coverUrl, cs: cs, fit: BoxFit.contain, httpHeaders: headers, title: title, author: authorName),
+                  if (hasEbook && !selectionMode)
+                    const Positioned(top: 4, left: 4, child: EbookCoverBadge()),
+                  if (isExplicit)
+                    Positioned(
+                      top: 4, right: DownloadService().isDownloaded(item['id'] as String? ?? '') ? 30 : 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.red.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(l.bookCardExplicitBadge, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                  if (DownloadService().isDownloaded(item['id'] as String? ?? ''))
+                    const Positioned(
+                      left: 0, right: 0, bottom: 0,
+                      child: CoverStateBadges(isDownloaded: true, isFinished: false),
+                    ),
+                ],
+              ),
+            ),
+            // Info section
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: tt.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: cs.onSurface,
+                      ),
+                    ),
+                    if (authorName.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        authorName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: tt.bodySmall?.copyWith(
+                          color: cs.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                    if (showProgress) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: progress.clamp(0, 1),
+                                minHeight: 5,
+                                backgroundColor: cs.surfaceContainerHighest,
+                                valueColor: AlwaysStoppedAnimation(cs.primary),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '${(progress * 100).round()}%',
+                            style: tt.labelSmall?.copyWith(
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Compact vertical card with a square cover on top and text below.
+  Widget _buildCompactCard(
+    BuildContext context,
+    ColorScheme cs,
+    TextTheme tt,
+    AppLocalizations l,
+    String title,
+    String subtitle,
+    String authorName,
+    String? coverUrl,
+    double progress,
+    Map<String, String> headers, {
+    bool isFinished = false,
+    bool isSkimmed = false,
+    bool isDownloaded = false,
+    bool isExplicit = false,
+    int unfinishedCount = 0,
+    bool hasEbook = false,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Cover
+        AspectRatio(
+          aspectRatio: coverAspectRatio,
+          child: _PressableCard(
+            onTap: () => _navigateToDetail(context),
+            onLongPress: () => _onLongPress(context),
+            borderRadius: 12,
+            child: Card(
+              elevation: 0,
+              margin: EdgeInsets.zero,
+              color: cs.surfaceContainerHigh,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  _CoverImage(coverUrl: coverUrl, cs: cs, httpHeaders: headers, coverAspectRatio: coverAspectRatio, title: title, author: authorName),
+                  if (progress > 0 && !isFinished)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: ClipRRect(
+                        borderRadius: const BorderRadius.vertical(
+                          bottom: Radius.circular(12),
+                        ),
+                        child: LinearProgressIndicator(
+                          value: progress.clamp(0, 1),
+                          minHeight: 3,
+                          backgroundColor: Colors.transparent,
+                          valueColor: AlwaysStoppedAnimation(cs.primary),
+                        ),
+                      ),
+                    ),
+                  if (isExplicit)
+                    Positioned(
+                      top: unfinishedCount > 0 ? 26 : 4,
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.red.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(l.bookCardExplicitBadge, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                  if (unfinishedCount > 0)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: cs.primary,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          '$unfinishedCount',
+                          style: TextStyle(
+                            color: cs.onPrimary,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ),
+                  if (hasEbook && !selectionMode)
+                    const Positioned(top: 4, left: 4, child: EbookCoverBadge()),
+                  if (isFinished || isDownloaded)
+                    Positioned(
+                      left: 0, right: 0, bottom: 0,
+                      child: CoverStateBadges(
+                        isDownloaded: isDownloaded,
+                        isFinished: isFinished,
+                        isSkimmed: isSkimmed,
+                        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 6),
+        // Title
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          child: Text(
+            title,
+            maxLines: coverAspectRatio < 1.0 ? 1 : 2,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelMedium?.copyWith(
+              fontWeight: FontWeight.w500,
+              color: cs.onSurface,
+            ),
+          ),
+        ),
+        // Subtitle. A book without one hands the line to the author instead
+        // of leaving a gap under the title.
+        if (showSubtitle && subtitle.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 2),
+            child: Text(
+              subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant.withValues(alpha: 0.75),
+              ),
+            ),
+          ),
+        if (authorName.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 2),
+            child: Text(
+              authorName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// Reusable cover image with placeholder.
+class _CoverImage extends StatelessWidget {
+  final String? coverUrl;
+  final ColorScheme cs;
+  final BoxFit fit;
+  final Map<String, String> httpHeaders;
+  final double coverAspectRatio;
+  final String? title;
+  final String? author;
+
+  const _CoverImage({required this.coverUrl, required this.cs, this.fit = BoxFit.cover, this.httpHeaders = const {}, this.coverAspectRatio = 1.0, this.title, this.author});
+
+  @override
+  Widget build(BuildContext context) {
+    if (coverUrl == null || coverUrl!.isEmpty) {
+      return _placeholder();
+    }
+
+    final isSquare = (coverAspectRatio - 1.0).abs() < 0.01;
+    final effectiveFit = isSquare ? BoxFit.contain : fit;
+
+    // Local file path (offline cached cover)
+    if (coverUrl!.startsWith('/')) {
+      final file = File(coverUrl!);
+      if (file.existsSync()) {
+        return EinkCoverTone(child: BlurPaddedCover(
+          enabled: isSquare,
+          blurChild: Image.file(file, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const SizedBox.shrink()),
+          child: Image.file(file, fit: effectiveFit, errorBuilder: (_, __, ___) => _placeholder()),
+        ));
+      }
+      return _placeholder();
+    }
+
+    return EinkCoverTone(child: BlurPaddedCover(
+      enabled: isSquare,
+      blurChild: CoverImage(
+        url: coverUrl!,
+        fit: BoxFit.cover,
+        headers: httpHeaders,
+        memCacheWidth: 32,
+        errorWidget: const SizedBox.shrink(),
+      ),
+      child: CoverImage(
+        url: coverUrl!,
+        fit: effectiveFit,
+        headers: httpHeaders,
+        placeholder: _placeholder(),
+        errorWidget: _placeholder(),
+      ),
+    ));
+  }
+
+  /// Home shelves used to show a bare headphones icon here while the library
+  /// grid showed the generated title card, so the same coverless book looked
+  /// different depending on the screen. One placeholder everywhere now.
+  Widget _placeholder() => CoverPlaceholder(title: title, author: author);
+}
+
+/// Pressable wrapper that scales down slightly on tap for tactile feedback.
+class _PressableCard extends StatefulWidget {
+  final Widget child;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+  final double borderRadius;
+
+  const _PressableCard({
+    required this.child,
+    required this.onTap,
+    this.onLongPress,
+    this.borderRadius = 12,
+  });
+
+  @override
+  State<_PressableCard> createState() => _PressableCardState();
+}
+
+class _PressableCardState extends State<_PressableCard>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _scale;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 100),
+      reverseDuration: const Duration(milliseconds: 200),
+    );
+    _scale = Tween<double>(begin: 1.0, end: 0.96).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: (_) => _controller.forward(),
+      onTapUp: (_) {
+        _controller.reverse();
+        widget.onTap();
+      },
+      onTapCancel: () => _controller.reverse(),
+      onLongPress: widget.onLongPress == null
+          ? null
+          : () {
+              _controller.reverse();
+              widget.onLongPress!();
+            },
+      child: ScaleTransition(
+        scale: _scale,
+        child: widget.child,
+      ),
+    );
+  }
+}

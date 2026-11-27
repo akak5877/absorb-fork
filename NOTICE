@@ -1,0 +1,40 @@
+Absorb Fork
+===========
+
+This build is a modified version of Absorb.
+
+Upstream:  https://github.com/pounat/absorb
+Copyright: (C) 2026 Nathan Poulson
+License:   GNU General Public License, version 3 or later (see LICENSE),
+           including the Additional Permission under GPLv3 Section 7.
+
+Modifications in this fork (November 2026):
+  - chapter-skip / playback-stall fixes, atomic cross-track chapter seeks
+  - persistent cover cache with background warm-up
+  - faster cold start (UI no longer blocks on the server handshake)
+  - own application id (com.lw.absorb), app name, icon and signing key
+
+The full corresponding source for every published binary is this repository,
+at the same tag as the release.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+Third-party components
+----------------------
+
+Bundled Flutter packages keep their own licenses; see the LICENSE file inside
+each package under packages/ (just_audio, audio_service, flutter_carplay,
+flutter_chrome_cast, flutter_epub_viewer, whisper_ggml_plus) and the pub
+packages listed in pubspec.lock.
+
+  - Noto Sans JP (assets/fonts/NotoSansJP-Regular.otf)
+    Copyright Google Inc., SIL Open Font License 1.1
+    https://scripts.sil.org/OFL
+
+  - foliate-js (assets/foliate)
+    Copyright John Factotum, MIT License
+    https://github.com/johnfactotum/foliate-js
+
+This fork is not affiliated with or endorsed by the upstream author.

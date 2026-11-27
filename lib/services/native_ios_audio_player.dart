@@ -1,0 +1,431 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:just_audio/just_audio.dart' as ja;
+import 'scoped_prefs.dart';
+
+/// Native iOS audio engine wrapper. Mimics enough of just_audio's
+/// `AudioPlayer` surface that AudioPlayerHandler treats it as a drop-in.
+/// Talks to AbsorbAudioEngine via `com.absorb.audio_engine` method channel
+/// and `com.absorb.audio_engine.events` event channel.
+class NativeIosAudioPlayer {
+  static const _methodChannel = MethodChannel('com.absorb.audio_engine');
+  static const _eventChannel = EventChannel('com.absorb.audio_engine.events');
+
+  NativeIosAudioPlayer() {
+    _eventSub = _eventChannel.receiveBroadcastStream().listen(
+      _onEvent,
+      onError: (Object e) {
+        debugPrint('[NativeIosAudioPlayer] event stream error: $e');
+      },
+    );
+  }
+
+  StreamSubscription? _eventSub;
+
+  // Cached state mirrors the native engine.
+  Duration _position = Duration.zero;
+  Duration? _duration;
+  Duration _bufferedPosition = Duration.zero;
+  bool _playing = false;
+  ja.ProcessingState _processingState = ja.ProcessingState.idle;
+  double _speed = 1.0;
+  double _volume = 1.0;
+  int? _currentIndex;
+  DateTime _updateTime = DateTime.now();
+
+  // Stream controllers; broadcast so multiple listeners are allowed.
+  final _positionController = StreamController<Duration>.broadcast();
+  final _durationController = StreamController<Duration?>.broadcast();
+  final _bufferedPositionController = StreamController<Duration>.broadcast();
+  final _playerStateController = StreamController<ja.PlayerState>.broadcast();
+  final _processingStateController = StreamController<ja.ProcessingState>.broadcast();
+  final _playbackEventController = StreamController<ja.PlaybackEvent>.broadcast();
+  final _currentIndexController = StreamController<int?>.broadcast();
+
+  // Notified by AudioPlayerHandler-style consumers when the engine auto-advances
+  // mid-book to the pre-buffered next book.
+  final _bookAutoAdvancedController = StreamController<void>.broadcast();
+
+  Stream<Duration> get positionStream => _positionController.stream;
+  Stream<Duration?> get durationStream => _durationController.stream;
+  Stream<Duration> get bufferedPositionStream => _bufferedPositionController.stream;
+  Stream<ja.PlayerState> get playerStateStream => _playerStateController.stream;
+  Stream<ja.ProcessingState> get processingStateStream => _processingStateController.stream;
+  Stream<ja.PlaybackEvent> get playbackEventStream => _playbackEventController.stream;
+  Stream<int?> get currentIndexStream => _currentIndexController.stream;
+
+  /// Fired when the engine has swapped to a pre-buffered next book mid-flight.
+  /// AudioPlayerService listens to this instead of inferring from position
+  /// jumps + completion races.
+  Stream<void> get bookAutoAdvancedStream => _bookAutoAdvancedController.stream;
+
+  Duration get position => _position;
+  Duration? get duration => _duration;
+  Duration get bufferedPosition => _bufferedPosition;
+  bool get playing => _playing;
+  ja.ProcessingState get processingState => _processingState;
+  double get speed => _speed;
+  double get volume => _volume;
+  int? get currentIndex => _currentIndex;
+
+  /// Android-only; always null on iOS, matches just_audio's iOS behavior.
+  int? get androidAudioSessionId => null;
+
+  /// Current playback event snapshot. AudioPlayerHandler reads this in
+  /// `refreshPlaybackState`; mirror the just_audio shape.
+  ja.PlaybackEvent get playbackEvent => _buildPlaybackEvent();
+
+  // ─── Source loading ───
+
+  // Loads still waiting on the engine. The engine's periodic observer keeps
+  // ticking through a load, and the first ticks after the item swap report
+  // the new item at 0 before its start seek lands. Position readers turned
+  // that into "track offset + 0" and saved it as progress (a book mid-way
+  // through track 2 came back at 20s). Like just_audio, report the requested
+  // start until the load has answered.
+  int _loadsInFlight = 0;
+
+  Future<Duration?> setAudioSource(ja.AudioSource source, {
+    Duration? initialPosition,
+    int? initialIndex,
+    bool preload = true,
+    String? itemId,
+  }) async {
+    final tracks = _flattenSource(source);
+    if (tracks.isEmpty) return null;
+
+    // A new source must never inherit the outgoing track's duration. The
+    // native load may legitimately return no duration, and returning the old
+    // cache here made single-file books look truncated after a title switch.
+    _duration = null;
+    _durationController.add(null);
+
+    // `initialPosition` is local to `initialIndex`, the same shape as seek().
+    // The engine needs the index spelled out: the offsets handed to it below
+    // are empty, so deriving the track from the start position would put
+    // every mid-book load on track 0.
+    final startIndex = initialIndex ?? 0;
+    final startS = (initialPosition?.inMilliseconds ?? 0) / 1000.0;
+    _currentIndex = startIndex;
+    _currentIndexController.add(startIndex);
+    _position = initialPosition ?? Duration.zero;
+    _updateTime = DateTime.now();
+    _loadsInFlight++;
+    try {
+      final eqEnabled = await ScopedPrefs.getBool('eq_enabled') ?? false;
+      final result = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>('load', {
+        'tracks': tracks.map(_trackToMap).toList(),
+        'trackOffsets': _buildTrackOffsets(tracks),
+        'startTrackIndex': startIndex,
+        'startPositionS': startS,
+        'totalDurationS': _totalDurationHint,
+        'speed': _speed,
+        'volume': _volume,
+        'eqEnabled': eqEnabled,
+        // Lets AbsorbPlayerCore recognise this book on a widget-driven resume so
+        // it adopts the live engine instead of starting a duplicate stream.
+        if (itemId != null) 'itemId': itemId,
+      });
+      final durS = (result?['durationS'] as num?)?.toDouble();
+      final loadedDuration = durS != null && durS > 0
+          ? Duration(milliseconds: (durS * 1000).round())
+          : null;
+      _duration = loadedDuration;
+      _durationController.add(loadedDuration);
+      return loadedDuration;
+    } finally {
+      _loadsInFlight--;
+    }
+  }
+
+  /// New: pre-buffer the next book so the engine can swap to it gaplessly when
+  /// the current item ends. Not part of just_audio's API.
+  Future<bool> setNextSource(ja.AudioSource? source, {double startPositionS = 0, double totalDurationS = 0, String? itemId}) async {
+    if (source == null) {
+      await _methodChannel.invokeMethod('clearNextSource');
+      return true;
+    }
+    final tracks = _flattenSource(source);
+    if (tracks.isEmpty) return false;
+    final result = await _methodChannel.invokeMethod<bool>('setNextSource', {
+      'tracks': tracks.map(_trackToMap).toList(),
+      'trackOffsets': _buildTrackOffsets(tracks),
+      'startPositionS': startPositionS,
+      'totalDurationS': totalDurationS,
+      // So the engine can adopt the right book id after it auto-advances.
+      if (itemId != null) 'itemId': itemId,
+    });
+    return result ?? false;
+  }
+
+  // ─── Control ───
+
+  Future<void> play() async {
+    await _methodChannel.invokeMethod('play');
+    _playing = true;
+    _emitPlayerState();
+  }
+
+  Future<void> pause() async {
+    await _methodChannel.invokeMethod('pause');
+    _playing = false;
+    _emitPlayerState();
+  }
+
+  Future<void> stop() async {
+    await _methodChannel.invokeMethod('stop');
+    _playing = false;
+    _processingState = ja.ProcessingState.idle;
+    _emitPlayerState();
+  }
+
+  Future<void> seek(Duration? position, {int? index}) async {
+    final s = (position?.inMilliseconds ?? 0) / 1000.0;
+    // `index` is the track within a multi-file book. The engine seeks to the
+    // track-local position `s` inside that track; AudioPlayerService has
+    // already converted the absolute book position into (index, local offset).
+    await _methodChannel.invokeMethod<bool>('seek', {
+      'positionS': s,
+      if (index != null) 'index': index,
+    });
+    _position = position ?? Duration.zero;
+    if (index != null) _currentIndex = index;
+    _updateTime = DateTime.now();
+    _positionController.add(_position);
+    _playbackEventController.add(_buildPlaybackEvent());
+  }
+
+  Future<void> setSpeed(double speed) async {
+    _speed = speed;
+    await _methodChannel.invokeMethod('setSpeed', {'speed': speed});
+    _playbackEventController.add(_buildPlaybackEvent());
+  }
+
+  Future<void> setVolume(double volume) async {
+    _volume = volume;
+    await _methodChannel.invokeMethod('setVolume', {'volume': volume});
+  }
+
+  /// No-op on iOS; just_audio's iOS plugin doesn't support skip-silence either.
+  Future<void> setSkipSilenceEnabled(bool enabled) async {}
+
+  /// Sleep timer chime uses ja.AudioPlayer.setAsset directly; this wrapper
+  /// should never be the chime player. Throw to surface misuse early.
+  Future<Duration?> setAsset(String asset) async {
+    throw UnsupportedError('NativeIosAudioPlayer.setAsset is not implemented; use ja.AudioPlayer for the chime.');
+  }
+
+  /// Snapshot of what the native engine is actually doing right now. Used on
+  /// foreground resume to reconcile after a widget-driven session: the engine
+  /// may have kept playing (or advanced) while Flutter was suspended. Returns
+  /// null on failure.
+  Future<NativeEngineState?> engineState() async {
+    try {
+      final raw = await _methodChannel
+          .invokeMethod<Map<dynamic, dynamic>>('engineState');
+      if (raw == null) return null;
+      return NativeEngineState(
+        itemId: raw['itemId'] as String?,
+        isLoaded: (raw['isLoaded'] as bool?) ?? false,
+        isPlaying: (raw['isPlaying'] as bool?) ?? false,
+        trackIndex: (raw['trackIndex'] as int?) ?? 0,
+        globalPositionS: (raw['globalPositionS'] as num?)?.toDouble() ?? 0,
+      );
+    } catch (e) {
+      debugPrint('[NativeIosAudioPlayer] engineState failed: $e');
+      return null;
+    }
+  }
+
+  /// Adopt the engine's current playing-state without issuing a new command.
+  /// Called when foreground resume finds the engine already playing the right
+  /// book - we just sync the Dart mirror so the UI reflects reality.
+  void adoptPlayingState(bool playing) {
+    _playing = playing;
+    _processingState = ja.ProcessingState.ready;
+    _processingStateController.add(_processingState);
+    _emitPlayerState();
+    _playbackEventController.add(_buildPlaybackEvent());
+  }
+
+  Future<void> attachEqualizerTap() async {
+    await _methodChannel.invokeMethod('attachEqualizerTap');
+  }
+
+  Future<void> detachEqualizerTap() async {
+    await _methodChannel.invokeMethod('detachEqualizerTap');
+  }
+
+  Future<void> dispose() async {
+    await _eventSub?.cancel();
+    _eventSub = null;
+    try {
+      await _methodChannel.invokeMethod('dispose');
+    } catch (_) {}
+    await _positionController.close();
+    await _durationController.close();
+    await _bufferedPositionController.close();
+    await _playerStateController.close();
+    await _processingStateController.close();
+    await _playbackEventController.close();
+    await _currentIndexController.close();
+    await _bookAutoAdvancedController.close();
+  }
+
+  // ─── Event channel handler ───
+
+  void _onEvent(dynamic raw) {
+    if (raw is! Map) return;
+    final type = raw['type'] as String?;
+    switch (type) {
+      case 'position':
+        if (_loadsInFlight > 0) break;
+        final s = (raw['positionS'] as num?)?.toDouble() ?? 0;
+        _position = Duration(milliseconds: (s * 1000).round());
+        _updateTime = DateTime.now();
+        _positionController.add(_position);
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'state':
+        _playing = (raw['playing'] as bool?) ?? false;
+        final psRaw = (raw['processingState'] as int?) ?? 0;
+        _processingState = _mapProcessingState(psRaw);
+        _processingStateController.add(_processingState);
+        _emitPlayerState();
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'duration':
+        final s = (raw['durationS'] as num?)?.toDouble();
+        _duration = s != null && s > 0 ? Duration(milliseconds: (s * 1000).round()) : null;
+        _durationController.add(_duration);
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'trackChanged':
+        final idx = (raw['trackIndex'] as int?);
+        _currentIndex = idx;
+        _currentIndexController.add(idx);
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'bookCompleted':
+        _processingState = ja.ProcessingState.completed;
+        _processingStateController.add(_processingState);
+        _emitPlayerState();
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'bookAutoAdvanced':
+        _bookAutoAdvancedController.add(null);
+        break;
+      case 'bufferedPosition':
+        final s = (raw['bufferedPositionS'] as num?)?.toDouble() ?? 0;
+        _bufferedPosition = Duration(milliseconds: (s * 1000).round());
+        _bufferedPositionController.add(_bufferedPosition);
+        _playbackEventController.add(_buildPlaybackEvent());
+        break;
+      case 'error':
+        final msg = raw['message'] as String? ?? 'engine error';
+        debugPrint('[NativeIosAudioPlayer] engine error: $msg');
+        break;
+    }
+  }
+
+  ja.ProcessingState _mapProcessingState(int raw) {
+    switch (raw) {
+      case 0: return ja.ProcessingState.idle;
+      case 1: return ja.ProcessingState.loading;
+      case 2: return ja.ProcessingState.buffering;
+      case 3: return ja.ProcessingState.ready;
+      case 4: return ja.ProcessingState.completed;
+      default: return ja.ProcessingState.idle;
+    }
+  }
+
+  void _emitPlayerState() {
+    _playerStateController.add(ja.PlayerState(_playing, _processingState));
+  }
+
+  ja.PlaybackEvent _buildPlaybackEvent() {
+    return ja.PlaybackEvent(
+      processingState: _processingState,
+      updateTime: _updateTime,
+      updatePosition: _position,
+      bufferedPosition: _bufferedPosition,
+      duration: _duration,
+      currentIndex: _currentIndex,
+    );
+  }
+
+  // ─── AudioSource translation ───
+
+  // Used as a hint to the native engine when load lacks an explicit duration.
+  // setAudioSource doesn't receive a duration directly, so we leave it at 0
+  // and let the engine read it from the asset after load.
+  double get _totalDurationHint => 0;
+
+  List<_NativeTrack> _flattenSource(ja.AudioSource source) {
+    final out = <_NativeTrack>[];
+    _collect(source, out);
+    return out;
+  }
+
+  void _collect(ja.AudioSource source, List<_NativeTrack> out) {
+    if (source is ja.ConcatenatingAudioSource) {
+      for (final child in source.children) {
+        _collect(child, out);
+      }
+      return;
+    }
+    if (source is ja.UriAudioSource) {
+      final uri = source.uri;
+      final headers = source.headers ?? const <String, String>{};
+      final isLocal = uri.scheme == 'file' || uri.scheme.isEmpty;
+      out.add(_NativeTrack(
+        url: isLocal ? uri.toFilePath() : uri.toString(),
+        isLocal: isLocal,
+        headers: headers,
+      ));
+      return;
+    }
+    debugPrint('[NativeIosAudioPlayer] Unsupported AudioSource: ${source.runtimeType}');
+  }
+
+  Map<String, dynamic> _trackToMap(_NativeTrack t) => {
+        'url': t.url,
+        'isLocal': t.isLocal,
+        'headers': t.headers,
+      };
+
+  /// Without per-track durations available here, hand the engine an empty
+  /// offsets list and let it fall back to single-track behavior. The
+  /// AudioPlayerService already maintains its own `_trackStartOffsets` from
+  /// the cached audioTracks and applies the global-position math on the Dart
+  /// side, so the engine's offsets are only used internally for seek routing.
+  List<double> _buildTrackOffsets(List<_NativeTrack> tracks) {
+    if (tracks.length <= 1) return const [];
+    return const [];
+  }
+}
+
+class _NativeTrack {
+  _NativeTrack({required this.url, required this.isLocal, required this.headers});
+  final String url;
+  final bool isLocal;
+  final Map<String, String> headers;
+}
+
+/// Snapshot of the native iOS engine's live state, read over the method
+/// channel for foreground-resume reconciliation.
+class NativeEngineState {
+  NativeEngineState({
+    required this.itemId,
+    required this.isLoaded,
+    required this.isPlaying,
+    required this.trackIndex,
+    required this.globalPositionS,
+  });
+  final String? itemId;
+  final bool isLoaded;
+  final bool isPlaying;
+  final int trackIndex;
+  final double globalPositionS;
+}

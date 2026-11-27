@@ -1,0 +1,7620 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' show max, min;
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_epub_viewer/flutter_epub_viewer.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart' show CompressFormat, ScreenshotConfiguration;
+import 'package:url_launcher/url_launcher.dart';
+import 'dictionary_sheet.dart';
+import '../services/dictionary_service.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../l10n/app_localizations.dart';
+import '../providers/auth_provider.dart';
+import '../providers/library_provider.dart';
+import '../screens/app_shell.dart';
+import '../services/api_service.dart';
+import '../services/audio_locator.dart';
+import '../services/audio_player_service.dart';
+import '../services/chapter_lookup.dart';
+import '../services/chromecast_service.dart';
+import '../services/download_service.dart';
+import '../services/ebook_annotation_service.dart';
+import '../services/ebook_cache.dart';
+import '../services/find_in_ebook.dart';
+import '../services/progress_sync_service.dart';
+import '../services/reader_font_service.dart';
+import '../services/scoped_prefs.dart';
+import '../services/lyrics_service.dart';
+import '../services/read_along_script.dart';
+import '../services/read_listen_sync.dart';
+import '../services/ebook_history.dart';
+import '../services/local_session_service.dart';
+import 'absorbing_shared.dart' show dateLabel, timeOfDay;
+import '../services/media_overlay.dart';
+import '../services/narration_script.dart';
+import '../services/narration_service.dart';
+import '../services/screen_wake.dart';
+import '../services/sync_point_store.dart';
+import '../services/transcript_line_store.dart';
+import '../services/transcription_service.dart';
+import '../services/volume_key_service.dart';
+import '../utils/chapter_title_match.dart';
+import 'overlay_toast.dart';
+import 'page_curl.dart';
+import 'reader_tap_zones.dart';
+import 'transcription_download_prompt.dart';
+import 'narration_download_dialog.dart';
+import 'progress_dialog.dart';
+import 'quote_share_sheet.dart';
+import 'book_detail_sheet.dart';
+import 'card_button_config.dart' show buttonDefById, localizedCardButtonLabel;
+import 'card_buttons.dart'
+    show CardSpeedSheet, MoreMenuItem, SimpleBookmarkSheet, showInactiveToast;
+import 'card_chapters_sheet.dart';
+import 'chromecast_button.dart';
+import 'equalizer_sheet.dart';
+import 'sleep_timer_sheet.dart';
+
+typedef _ReaderAction = ({
+  IconData icon,
+  String label,
+  Color? tint,
+  bool enabled,
+  VoidCallback onTap,
+});
+
+/// Reader background/text presets (e-reader themes). Colors are hex so they
+/// feed both the WebView CSS and the Flutter overlays.
+class _ReaderPalette {
+  final String id;
+  final String label;
+  final String bg; // '#rrggbb'
+  final String fg;
+  const _ReaderPalette(this.id, this.label, this.bg, this.fg);
+  Color get bgColor => Color(int.parse('FF${bg.substring(1)}', radix: 16));
+  Color get fgColor => Color(int.parse('FF${fg.substring(1)}', radix: 16));
+}
+
+const _kReaderPalettes = [
+  _ReaderPalette('light', 'Light', '#ffffff', '#121212'),
+  _ReaderPalette('sepia', 'Sepia', '#f4ecd8', '#5b4636'),
+  _ReaderPalette('gray', 'Gray', '#333537', '#e6e6e6'),
+  _ReaderPalette('dark', 'Dark', '#000000', '#ffffff'),
+];
+
+
+class EbookReaderView extends StatefulWidget {
+  final String itemId;
+  final String title;
+  final Map<String, dynamic> ebookFile;
+  /// Opens here instead of the saved reading position, for jumping straight
+  /// to a highlight from outside the reader.
+  final String? openAtCfi;
+  /// Find in ebook: a Whisper transcript of the audio just heard. When set,
+  /// the reader fuzzy-locates it once loaded and jumps there if confident;
+  /// otherwise it stays at the normal position and toasts. [findChapterHint]
+  /// is the audio chapter it came from - searched first, and used to accept
+  /// borderline matches only when the location agrees.
+  final String? findText;
+  final String? findChapterHint;
+  /// The audio position [findText] was transcribed at, so a not-confident
+  /// first pass can transcribe a longer window and retry.
+  final double? findPositionSeconds;
+  /// Find in ebook on a book whose audio is its EPUB's narration: the book
+  /// time to open at, on the sentence read then.
+  final double? openAtAudioSeconds;
+  /// Turn read along on as soon as the book is displayed, for the card's
+  /// Read along button.
+  final bool startReadAlong;
+
+  const EbookReaderView({
+    super.key,
+    required this.itemId,
+    required this.title,
+    required this.ebookFile,
+    this.openAtCfi,
+    this.findText,
+    this.findChapterHint,
+    this.findPositionSeconds,
+    this.openAtAudioSeconds,
+    this.startReadAlong = false,
+  });
+
+  @override
+  State<EbookReaderView> createState() => EbookReaderViewState();
+}
+
+class EbookReaderViewState extends State<EbookReaderView> with WidgetsBindingObserver {
+  EpubController? _epubController;
+  bool _loading = true;
+  String? _error;
+  File? _cachedFile;
+  String? _cachedLocations;
+  // Swiping to the recents/app-switcher un-hides the system bars. The frozen
+  // safe-area padding (see _buildViewerArea) keeps that from resizing the
+  // WebView, but if a resize still gets through (some OEMs resize the window
+  // itself), epub.js re-paginates and re-anchors a page back, firing a stray
+  // relocate that would save that wrong page. Remember the real page while
+  // backgrounded, ignore relocations that arrive while away, and restore the
+  // page on return if one actually drifted us.
+  bool _readerActive = true;
+  String? _bgCfi;
+  bool _bgDrifted = false;
+  String? _initialCfi;
+  // Set when the saved spot is another app's format (AudioBooth saves a JSON
+  // locator): the reader opens at the start and moves to this percentage once
+  // epub.js can map percentages to pages.
+  double? _pendingPercentJump;
+  String? _firstShownCfi;
+  // The place is written back only once the reader has moved from where it
+  // opened. The landing can be off from the server's spot (another app's
+  // page size, a percent jump, a slow server), and saving it replaced the
+  // real place before a single page was turned.
+  bool _holdOpenSpot = true;
+
+  // Reading time kept as a session (the Tt switch): counted while the page
+  // is on screen and has moved in the last few minutes, and not while this
+  // book's audio plays (that listening session already counts it).
+  static const _kLogReading = 'ereader_log_reading';
+  bool _logReading = false;
+  Timer? _readingTimer;
+  ApiService? _readingApi;
+  String? _readingSessionId;
+  DateTime? _readingStartedAt;
+  double? _readingStartPct;
+  int _readingSeconds = 0;
+  int _readingSent = 0;
+  DateTime _readingActiveAt = DateTime.now();
+  bool _readingAudioWasOn = false;
+  double _audioTotal = 0;
+  bool _showControls = false;
+  List<EpubChapter> _chapters = [];
+  double _progress = 0;
+  // epub.js reports a usable page percentage only after its CFI location index
+  // is built/loaded. Until then we don't trust or sync value.progress.
+  bool _locationsReady = false;
+  int _chapterPage = 0;
+  int _chapterPageTotal = 0;
+  String? _currentChapterTitle;
+
+  // Annotations
+  final _annotationService = EbookAnnotationService();
+  List<EbookAnnotation> _annotations = [];
+  bool _hasBookmarkAtCurrent = false;
+  String? _currentCfi;
+
+  // Search state - persisted across screen opens so the user keeps their results
+  String _searchQuery = '';
+  List<EpubSearchResult> _searchResults = [];
+  List<String?> _resultChapters = []; // parallel to _searchResults
+  String _lastSearchedQuery = '';
+  // cfi -> which occurrence of the query within its section (for exact re-anchor)
+  final Map<String, int> _resultOccByCfi = {};
+
+  // Selection state for highlight menu
+  String? _selectionText;
+  String? _selectionCfi;
+  Rect? _selectionRect;
+  // Track touch start position to distinguish taps from swipes
+  double? _touchDownX;
+  double? _touchDownY;
+  DateTime? _touchDownAt;
+  double? _ptrDownX;
+  double? _ptrDownY;
+
+  // Key to force-rebuild EpubViewer when layout mode changes
+  int _viewerKey = 0;
+  // onEpubLoaded is wired to epub.js's "displayed" event, which re-fires on
+  // every display() - so the load-time rescue re-display must run at most once
+  // per mount, or it re-triggers itself into an endless display->displayed loop
+  // that freezes page-turn taps. Reset whenever the viewer remounts.
+  bool _didLoadRescue = false;
+  // Where an outside jump (a highlight from the list) asked to land, re-applied
+  // once after the first paint - epub.js repaginates right after load and can
+  // round the target away.
+  String? _settleJumpCfi;
+  // Same event, same reason: the handler/highlight/font wiring must run once
+  // per mount, not on every chapter crossing - unguarded it stacked a new JS
+  // relocated-listener, re-registered every highlight and re-shipped the
+  // ~100KB font payload each time a chapter boundary was crossed.
+  bool _didInitViewer = false;
+  // Find in ebook runs once per mount, after the first paint has settled.
+  bool _didStartFind = false;
+  bool _finding = false;
+  // Shows the Find-in-audiobook action on the selection toolbar.
+  bool _transcriptionOn = false;
+  // Read along: follow the audiobook by coloring the words being spoken.
+  bool _readAlongOn = false;
+  bool _didAutoReadAlong = false;
+  // Backgrounding stops read along; this brings it back on return.
+  bool _readAlongResume = false;
+  // Catch up offers: each direction is offered once per visit.
+  bool _didScheduleCatchUp = false;
+  bool _offeredPageToAudio = false;
+  bool _offeredAudioToPage = false;
+  // Listening ahead: the runway fills faster with the playhead standing
+  // still, and nobody wants to hear words the page can't show yet. Armed at
+  // start; the first gated tick pauses a playing book (resumed by itself
+  // when ready) or notes a paused one (a toast when ready).
+  bool _readAlongGateArmed = false;
+  bool _readAlongGatePaused = false;
+  bool _readAlongGateWaiting = false;
+  // Start-up card in the middle of the page: 'finding' while the audio's
+  // spot is located in the book, 'listening' while the runway builds.
+  String? _readAlongPrep;
+  Timer? _readAlongTimer;
+  double? _readAlongLineStart;
+  double _readAlongLineLastWord = 0;
+  int _readAlongColor = PlayerSettings.defaultReadAlongColor;
+  String _readAlongMode = 'word';
+  // Words in the sentence as the page spells it, and as the transcript line
+  // does - the two can differ, so word positions are scaled between them.
+  int _readAlongPageWords = 0;
+  int _readAlongLineWords = 0;
+  int _readAlongWordIndex = -1;
+  // Where the current sentence sits in the page text, so the next lookup can
+  // prefer a match ahead of it rather than an earlier repeat of the phrase.
+  int _readAlongAt = -1;
+  double _readAlongLastPos = 0;
+  DateTime _readAlongLastScan = DateTime.fromMillisecondsSinceEpoch(0);
+  // Guards against turning the page twice for the same spot.
+  DateTime _readAlongLastTurn = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _readAlongStartedPipeline = false;
+  bool _readAlongLocating = false;
+  bool _readAlongAllowBack = false;
+  DateTime? _readAlongTurnPending;
+  DateTime? _readAlongMissSince;
+  bool _readAlongStepped = false;
+  DateTime? _readAlongSeekAt;
+  DateTime? _readAlongLastMatch;
+  bool _readAlongLost = false;
+  // You moved the page yourself while read along runs. The narration keeps
+  // its coloring wherever it is, but the page stops following it until you
+  // tap Back to narration or the narration reaches the page you are on.
+  bool _readAlongBrowsing = false;
+  DateTime _readAlongBrowseAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _readAlongSeenSince;
+  DateTime _readAlongOffPageLog = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // A narrated EPUB (EPUB 3 media overlays) knows which sentence is read
+  // when, so its read along follows those timings instead of transcribing.
+  MediaOverlay? _narration;
+  bool _narrationReadAlong = false;
+  OverlayClip? _narrationWentTo;
+  DateTime _narrationTurnAt = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _narrationTickBusy = false;
+  // Where the lit sentence was on the last tick: on, low, before, after.
+  String? _narrationWhere;
+
+  bool get _narrationOnScreen => _narrationWhere == 'on' || _narrationWhere == 'low';
+
+  bool _narrationFromServer = false;
+  bool _audioIsNarration = false;
+
+  /// Read along can follow the narration when the book's audio is that
+  /// narration: BookOrbit plays it as the audio, and an Audiobookshelf
+  /// ebook-only book has it fetched out of the EPUB. A book with its own
+  /// audiobook keeps transcription.
+  bool get _useNarration =>
+      _narration != null && (_narrationFromServer || !_hasAudio || _audioIsNarration);
+
+  // The narration and audio lookups started on open: read along waits for
+  // them, since which kind it is depends on their answers.
+  Future<void>? _narrationLookup;
+  Future<void>? _audioMetaLookup;
+
+  // Reader settings
+  int _fontSize = 16;
+  double _lineHeight = 1.4;
+  // Books justify their text by default; on a narrow screen that opens wide
+  // gaps between words, so the reader can force a ragged right edge.
+  bool _alignLeft = false;
+  int _marginH = 16; // left + right
+  String _volumeNavMode = 'off';
+  bool _volumeNavWhilePlaying = false;
+
+  // Auto scroll (rolling blind). Speed is px/sec of blind descent; the text
+  // itself never moves, so this is how fast the next page paints over this one.
+  bool _autoScroll = false;
+  double _autoScrollSpeed = 40;
+  bool _autoScrollPaused = false;
+  LiveOverlayToast? _speedToast;
+  int _marginV = 16; // top + bottom
+  // Page layout: auto shows two pages on wide screens (tablets), single forces
+  // one page, two forces a spread. Stored as index 0=auto/1=single/2=two.
+  EpubSpread _spread = EpubSpread.auto;
+  // Scroll down through the book instead of turning pages.
+  bool _scroll = false;
+  // How a page turns: 'none', 'slide' or one of the drawn turns.
+  String _turnStyle = 'slide';
+  ReaderTapZones _tapZones = const ReaderTapZones();
+  bool _editingTapZones = false;
+  // Space after each paragraph in em; below zero keeps the book's own.
+  double _paragraphSpacing = -1;
+  // Seconds before shown controls fade again; 0 keeps them until a tap.
+  int _controlsHideAfter = 5;
+  Timer? _controlsHideTimer;
+  // The curl is drawn here over pictures of the page, taken ahead of time so
+  // a turn can start at once.
+  final PageCurlController _curl = PageCurlController();
+  ui.Image? _curlShot;
+  String? _curlShotCfi;
+  Timer? _curlShotTimer;
+  bool _curling = false;
+  // Turns asked for while one plays, each played after it.
+  final List<bool> _pendingTurns = [];
+  int _curlRun = 0; // a newer turn makes an older one stop where it is
+  Completer<bool>? _curlLanded;
+  EdgeInsets _curlInset = EdgeInsets.zero;
+  // A sideways drag curling the page.
+  int? _curlPointer;
+  Offset? _curlDownAt;
+  DateTime _curlDownTime = DateTime.fromMillisecondsSinceEpoch(0);
+  bool? _curlDragForward;
+  bool _curlDragReady = false;
+  bool? _curlDragDecision;
+  Offset _curlDragLast = Offset.zero;
+  Offset _curlDragStart = Offset.zero;
+  Offset? _lastPointerAt;
+  DateTime _lastPointerTime = DateTime.fromMillisecondsSinceEpoch(0);
+  final List<(Duration, double)> _curlDragTrack = [];
+  // Keep the title and progress bar on screen above the page instead of
+  // fading them in over it. The page gets shorter, never covered.
+  bool _pinTop = false;
+  // What the top bar's progress follows: 'book', 'chapter' or 'both'.
+  String _topBarProgress = 'book';
+  // Hold the screen on for the whole read, not only while auto scroll or
+  // read along moves the page (GH #384).
+  bool _keepAwake = true;
+  // Auto scroll's own sleep timer, set by press-and-hold on its button.
+  Timer? _autoScrollSleepTimer;
+  DateTime? _autoScrollSleepEnd;
+  int _autoScrollSleepMinutes = 0;
+  // After that timer fires the screen may go dark even with keep-awake on,
+  // until the reader is touched again.
+  bool _screenWakeHeldOff = false;
+  static const _spreadModes = [EpubSpread.auto, EpubSpread.none, EpubSpread.always];
+  // E-reader background theme (empty = follow the app's light/dark) and font.
+  String _themeId = '';
+  String _fontId = 'original';
+
+  static const _kFontSize = 'ereader_fontSize';
+  static const _kLineHeight = 'ereader_lineHeight';
+  static const _kAlignLeft = 'ereader_alignLeft';
+  static const _kMargin = 'ereader_margin'; // legacy single margin (migrated)
+  static const _kMarginH = 'ereader_margin_h';
+  static const _kMarginV = 'ereader_margin_v';
+  static const _kSpread = 'ereader_spread';
+  static const _kTheme = 'ereader_theme';
+  static const _kFont = 'ereader_font';
+  static const _kPinTop = 'ereader_pin_top';
+  static const _kTopBarProgress = 'ereader_top_bar_progress';
+  static const _kKeepAwake = 'ereader_keep_awake';
+  // App-wide, not per account: one switch for every server's books.
+  static const _kScroll = 'ereader_scroll_mode';
+  static const _kTurnStyle = 'ereader_page_turn';
+  static const _kParagraphSpacing = 'ereader_paragraph_spacing';
+  static const _kControlsHide = 'ereader_controls_hide';
+  static const _kBarAction = 'ereader_bar_action';
+
+  // Gates the WebView mount until the entering route animation completes, so
+  // the heavy platform view doesn't stutter the open transition.
+  bool _entered = false;
+  Animation<double>? _routeAnim;
+
+  // In-reader media controls (immersion reading) drive the shared player.
+  int _forwardSkip = 30;
+  int _backSkip = 10;
+  // This item's audiobook metadata, so the controls can show (and start
+  // playback) even before a session is running.
+  bool _hasAudio = false;
+  // A download made on another account: the server signed in now is not this
+  // book's, and the same id there can be a different book. Its place is kept
+  // on the phone and nothing about it goes to this server.
+  late final bool _otherAccount = DownloadService().isFromOtherAccount(widget.itemId);
+  double _audioDuration = 0;
+  List<dynamic> _audioChapters = const [];
+  String _audioAuthor = '';
+  String? _audioCoverUrl;
+  bool _startingAudio = false;
+  // Which control sits in the player bar's left slot.
+  String _barAction = 'speed';
+  // Held from initState so dispose can lift the quiet without a context read.
+  late final LibraryProvider _quietLib;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    ReadListenSync.instance.readerOpened(widget.itemId);
+    _readingApi = context.read<AuthProvider>().apiService;
+    ScopedPrefs.getBool(_kLogReading).then((on) {
+      if (on == true && mounted) {
+        setState(() => _logReading = true);
+        _startReadingClock();
+      }
+    });
+    _epubController = EpubController();
+    _quietLib = context.read<LibraryProvider>();
+    _quietLib.setReaderQuiet(true);
+    _loadInitialLocation();
+    // A settings read failure must not stop the book from opening - fall back
+    // to the field defaults and open anyway.
+    _loadSettings()
+        .catchError((e) => debugPrint('[EbookReader] settings load failed: $e'))
+        .whenComplete(_downloadAndOpen);
+    // Fullscreen is toggled once the open transition completes (see _onRouteAnim
+    // / didChangeDependencies), not here: hiding the system bars mid-transition
+    // forces a full relayout while the busy home screen is still compositing
+    // behind the sliding-in reader, which makes opening from a home card janky.
+    PlayerSettings.settingsChanged.addListener(_loadSkipSettings);
+    _loadSkipSettings();
+    _audioMetaLookup = _loadAudioMeta();
+    _volumeNav.attach();
+    PlayerSettings.getTranscriptionEnabled().then((on) {
+      if (mounted && on) setState(() => _transcriptionOn = true);
+    });
+  }
+
+  // Volume-key turns are ignored while auto scroll runs: the blind is already
+  // showing the next page, and a turn underneath it leaves that page unread.
+  late final EreaderVolumeNav _volumeNav = EreaderVolumeNav(
+    onPrev: () {
+      if (_autoScroll) return;
+      _userMoved('volume key');
+      _turnPage(false);
+    },
+    onNext: () {
+      if (_autoScroll) return;
+      _userMoved('volume key');
+      _turnPage(true);
+    },
+  );
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      _readerActive = true;
+      // Restore the page we were on before the recents/background resize drifted
+      // it - only if a stray relocation actually fired while away, so the common
+      // no-resize round trip doesn't get a redundant re-display. Delay so the
+      // window has settled back to full size and epub.js has re-paginated,
+      // otherwise the re-display would round against the wrong (still-resizing)
+      // layout.
+      final cfi = _bgCfi;
+      final drifted = _bgDrifted;
+      _bgCfi = null;
+      _bgDrifted = false;
+      final resumeReadAlong = _readAlongResume;
+      _readAlongResume = false;
+      if (drifted && cfi != null && cfi.isNotEmpty) {
+        Future.delayed(const Duration(milliseconds: 350), () async {
+          if (!mounted || !_readerActive) return;
+          await _epubController?.display(cfi: cfi);
+          // The live page moved under the blind; re-seat it on the page after.
+          if (_autoScroll) await _epubController?.autoScrollResync();
+          if (resumeReadAlong) await _resumeReadAlong();
+        });
+      } else if (resumeReadAlong) {
+        unawaited(_resumeReadAlong());
+      }
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // Leaving the foreground: snapshot the real page and stop trusting
+      // relocations until we're back (they'll be resize artifacts).
+      if (_readerActive) {
+        _bgCfi = _currentCfi;
+        unawaited(_narrationCarryReadingSpot());
+        if (_logReading) unawaited(_sendReadingTime());
+      }
+      _readerActive = false;
+      // Following along costs transcription and a WebView call several times
+      // a second, and nobody is reading a page they can't see.
+      if (_readAlongOn) {
+        debugPrint('[ReadAlong] app backgrounded - stopping');
+        _readAlongResume = true;
+        _stopReadAlong();
+      }
+    } else {
+      if (_readerActive) _bgCfi = _currentCfi;
+      _readerActive = false;
+    }
+  }
+
+  Future<void> _loadAudioMeta() async {
+    final lib = context.read<LibraryProvider>();
+    _audioCoverUrl = lib.getCoverUrl(widget.itemId);
+    if (_otherAccount) return;
+    final api = context.read<AuthProvider>().apiService;
+    if (api == null) return;
+    try {
+      final item = await api.getLibraryItem(widget.itemId);
+      if (item == null || !mounted) return;
+      final media = item['media'] as Map<String, dynamic>? ?? {};
+      final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+      final dur = (media['duration'] as num?)?.toDouble() ?? 0;
+      setState(() {
+        _audioAuthor = metadata['authorName'] as String? ?? '';
+        _audioDuration = dur;
+        _audioChapters = media['chapters'] as List<dynamic>? ?? const [];
+        _hasAudio = dur > 0;
+        _audioTotal = dur;
+        _audioIsNarration = media['narration'] != null;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _startThisBook() async {
+    if (_startingAudio || !_hasAudio) return;
+    final api = context.read<AuthProvider>().apiService;
+    if (api == null) return;
+    setState(() => _startingAudio = true);
+    final lib = context.read<LibraryProvider>();
+    lib.addToAbsorbing(widget.itemId);
+    await AudioPlayerService().playItem(
+      api: api,
+      itemId: widget.itemId,
+      title: widget.title,
+      author: _audioAuthor,
+      coverUrl: _audioCoverUrl,
+      totalDuration: _audioDuration,
+      chapters: _audioChapters,
+      libraryId: lib.selectedLibraryId,
+      fromUi: true,
+    );
+    if (!mounted) return;
+    setState(() => _startingAudio = false);
+    unawaited(_maybeOfferCatchUp(audioStarting: true));
+  }
+
+  void _loadSkipSettings() {
+    PlayerSettings.getForwardSkip().then((v) {
+      if (mounted && v != _forwardSkip) setState(() => _forwardSkip = v);
+    });
+    PlayerSettings.getBackSkip().then((v) {
+      if (mounted && v != _backSkip) setState(() => _backSkip = v);
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_entered) return;
+    _routeAnim = ModalRoute.of(context)?.animation;
+    if (_routeAnim == null || _routeAnim!.isCompleted) {
+      _entered = true;
+      _setFullscreen(true); // no transition to wait for
+    } else {
+      _routeAnim!.addStatusListener(_onRouteAnim);
+    }
+  }
+
+  void _onRouteAnim(AnimationStatus status) {
+    if (status == AnimationStatus.completed && mounted) {
+      _routeAnim?.removeStatusListener(_onRouteAnim);
+      // Defer the immersive relayout until the reader fully covers the screen, so
+      // it doesn't jank the open animation over the busy home screen.
+      _setFullscreen(true);
+      setState(() => _entered = true);
+    }
+  }
+
+  Future<void> _loadSettings() async {
+    _fontSize = await ScopedPrefs.getInt(_kFontSize) ?? 16;
+    _lineHeight = await ScopedPrefs.getDouble(_kLineHeight) ?? 1.4;
+    _alignLeft = await ScopedPrefs.getBool(_kAlignLeft) ?? false;
+    final legacyMargin = await ScopedPrefs.getInt(_kMargin) ?? 16;
+    _marginH = await ScopedPrefs.getInt(_kMarginH) ?? legacyMargin;
+    _marginV = await ScopedPrefs.getInt(_kMarginV) ?? legacyMargin;
+    final si = (await ScopedPrefs.getInt(_kSpread) ?? 0).clamp(0, 2);
+    _spread = _spreadModes[si];
+    final prefs = await SharedPreferences.getInstance();
+    _scroll = prefs.getBool(_kScroll) ?? false;
+    final turn = prefs.getString(_kTurnStyle);
+    if (turn == 'none' || kDrawnTurnStyles.contains(turn)) _turnStyle = turn!;
+    _controlsHideAfter = prefs.getInt(_kControlsHide) ?? 5;
+    _tapZones = await ReaderTapZones.load();
+    _paragraphSpacing = await ScopedPrefs.getDouble(_kParagraphSpacing) ?? -1;
+    _themeId = await ScopedPrefs.getString(_kTheme) ?? '';
+    _fontId = await ScopedPrefs.getString(_kFont) ?? 'original';
+    _pinTop = await ScopedPrefs.getBool(_kPinTop) ?? false;
+    final barProgress = await ScopedPrefs.getString(_kTopBarProgress);
+    if (barProgress == 'chapter' || barProgress == 'both') _topBarProgress = barProgress!;
+    _keepAwake = await ScopedPrefs.getBool(_kKeepAwake) ?? true;
+    _barAction = await ScopedPrefs.getString(_kBarAction) ?? 'speed';
+    if (mounted) _syncScreenWake();
+    _volumeNavMode = await PlayerSettings.getEreaderVolumeNav();
+    _volumeNavWhilePlaying = await PlayerSettings.getEreaderVolumeNavWhilePlaying();
+    _autoScrollSpeed = (await PlayerSettings.getEreaderAutoScrollSpeed())
+        .clamp(_autoScrollMin, _autoScrollMax)
+        .toDouble();
+    if (mounted) setState(() {});
+  }
+
+  // Resolve the active palette; empty selection follows the app's brightness.
+  _ReaderPalette _resolvePalette(BuildContext context) {
+    for (final p in _kReaderPalettes) {
+      if (p.id == _themeId) return p;
+    }
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return dark ? _kReaderPalettes[3] : _kReaderPalettes[0];
+  }
+
+  ReaderFont get _font => readerFontById(_fontId) ?? kBuiltinReaderFonts.first;
+
+  Future<void> _updateReaderTheme(String id) async {
+    if (id == _themeId) return;
+    setState(() => _themeId = id);
+    _applySettings();
+    await ScopedPrefs.setString(_kTheme, id);
+  }
+
+  Future<void> _updateReaderFont(String id) async {
+    if (id == _fontId) return;
+    setState(() => _fontId = id);
+    _applySettings();
+    await _applyFontFace();
+    await ScopedPrefs.setString(_kFont, id);
+  }
+
+  /// Define the @font-face injector once: a content hook that stamps the
+  /// current downloaded font's @font-face into every rendered section's iframe.
+  void _setupFontInjector() {
+    _epubController?.webViewController?.evaluateJavascript(source: '''
+      (function(){
+        if (window.__absorbFontInit) return;
+        window.__absorbFontInit = true;
+        window.__absorbFontFace = '';
+        function applyTo(doc){
+          if(!doc || !doc.head) return;
+          var old = doc.getElementById('absorb-fontface');
+          if(old && old.parentNode) old.parentNode.removeChild(old);
+          if(!window.__absorbFontFace) return;
+          var s = doc.createElement('style');
+          s.id = 'absorb-fontface';
+          s.textContent = window.__absorbFontFace;
+          doc.head.appendChild(s);
+        }
+        // Exposed so the auto-scroll blind can stamp the same @font-face into
+        // its own iframe - a downloadable font is a per-document declaration,
+        // so a second rendition without this hook renders in a fallback face.
+        window.__absorbApplyFontToDoc = applyTo;
+        window.__absorbApplyFont = function(css){
+          window.__absorbFontFace = css || '';
+          try { rendition.getContents().forEach(function(c){ applyTo(c.document); }); } catch(e){}
+          try {
+            if (window.__absorbBlindRendition) {
+              window.__absorbBlindRendition.getContents().forEach(function(c){ applyTo(c.document); });
+            }
+          } catch(e){}
+        };
+        try { rendition.hooks.content.register(function(contents){ applyTo(contents.document); }); } catch(e){}
+      })();
+    ''');
+  }
+
+  /// Inject (or clear) the @font-face for the selected font as a base64 data
+  /// URI, so a downloaded woff2 renders inside the WebView on iOS and Android.
+  Future<void> _applyFontFace() async {
+    final font = _font;
+    String css = '';
+    if (font.downloadable) {
+      final b64 = await ReaderFontService().base64Woff2(font.id);
+      if (b64 != null) {
+        css = '@font-face{font-family:"${font.family}";'
+            'src:url(data:font/woff2;base64,$b64) format("woff2");font-display:swap;}';
+      }
+    }
+    await _epubController?.webViewController?.evaluateJavascript(
+        source: "if(window.__absorbApplyFont){window.__absorbApplyFont('$css');}");
+  }
+
+  Future<void> _updateSpread(int index) async {
+    final mode = _spreadModes[index];
+    if (mode == _spread) return;
+    setState(() {
+      // Re-open at the current page after the layout rebuild.
+      _initialCfi = _currentCfi ?? _initialCfi;
+      _pendingPercentJump = null;
+      _spread = mode;
+      _locationsReady = false;
+      _viewerKey++; // force the viewer to remount with the new spread
+      _didLoadRescue = false; // let the remounted viewer rescue its first paint
+      _didInitViewer = false; // fresh JS context needs its wiring again
+    });
+    await ScopedPrefs.setInt(_kSpread, index);
+  }
+
+  Future<void> _updateScroll(bool on) async {
+    if (on == _scroll) return;
+    // The rolling blind and the gliding page are different machinery, and
+    // read along follows the page, so both stop rather than carry over.
+    if (_autoScroll) await _toggleAutoScroll();
+    if (_readAlongOn) _stopReadAlong();
+    if (!mounted) return;
+    setState(() {
+      // Re-open at the current page after the layout rebuild.
+      _initialCfi = _currentCfi ?? _initialCfi;
+      _pendingPercentJump = null;
+      _scroll = on;
+      _locationsReady = false;
+      _chapterPage = 0;
+      _chapterPageTotal = 0;
+      _viewerKey++;
+      _didLoadRescue = false;
+      _didInitViewer = false;
+    });
+    await (await SharedPreferences.getInstance()).setBool(_kScroll, on);
+  }
+
+  // E-ink screens smear anything that moves, so pages turn at once there.
+  String get _turnNow => PlayerSettings.einkMode ? 'none' : _turnStyle;
+  // "Curl" in names here covers every turn drawn over pictures of the page.
+  bool get _curlOn => kDrawnTurnStyles.contains(_turnNow) && !_scroll && !_autoScroll;
+
+  // A ripple shows the new page coming through either way, so going back
+  // needs no picture of the earlier page first; only a curl plays backward.
+  bool get _revealsUnder => _turnNow != 'curl';
+
+  // The page itself only knows that the app draws these turns.
+  void _applyTurnStyle() =>
+      unawaited(_epubController?.setTurnStyle(kDrawnTurnStyles.contains(_turnNow) ? 'curl' : _turnNow));
+
+  String _turnStyleLabel(AppLocalizations l, String style) => switch (style) {
+        'none' => l.readerPageTurnNone,
+        'slide' => l.readerPageTurnSlide,
+        'curl' => l.readerPageTurnCurl,
+        _ => l.readerPageTurnRipple,
+      };
+
+  /// Where a turn starts: the finger that asked for it, or the side the page
+  /// is going to.
+  Offset _turnOrigin(bool forward) {
+    final at = _lastPointerAt;
+    if (at != null && DateTime.now().difference(_lastPointerTime) < const Duration(milliseconds: 800)) {
+      return at;
+    }
+    final size = _curl.size;
+    return Offset(size.width * (forward ? 0.85 : 0.15), size.height * 0.55);
+  }
+
+  Future<void> _updateParagraphSpacing(double em) async {
+    setState(() => _paragraphSpacing = em);
+    _applySettings();
+    await ScopedPrefs.setDouble(_kParagraphSpacing, em);
+  }
+
+  static String _emLabel(double v) =>
+      v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(2).replaceAll(RegExp(r'0$'), '');
+
+  Future<void> _updateControlsHideAfter(int seconds) async {
+    setState(() => _controlsHideAfter = seconds);
+    _armControlsHide();
+    await (await SharedPreferences.getInstance()).setInt(_kControlsHide, seconds);
+  }
+
+  /// Shown controls fade on their own after a while. A finger on them, a
+  /// sheet open over the reader or the tap zone editor keeps them up.
+  void _armControlsHide() {
+    _controlsHideTimer?.cancel();
+    if (!_showControls || _controlsHideAfter <= 0) return;
+    _controlsHideTimer = Timer(Duration(seconds: _controlsHideAfter), () {
+      if (!mounted || !_showControls) return;
+      if (_editingTapZones || !(ModalRoute.of(context)?.isCurrent ?? true)) {
+        _armControlsHide();
+        return;
+      }
+      setState(() => _showControls = false);
+    });
+  }
+
+  Widget _controlsTouchGuard(Widget child) => Listener(
+        onPointerDown: (_) => _controlsHideTimer?.cancel(),
+        onPointerUp: (_) => _armControlsHide(),
+        onPointerCancel: (_) => _armControlsHide(),
+        child: child,
+      );
+
+  void _editTapZones() {
+    setState(() {
+      _editingTapZones = true;
+      _showControls = false;
+    });
+  }
+
+  bool _barButtonShown(String id) => switch (id) {
+        'readalong' => _transcriptionOn || _useNarration,
+        'chapters' => _chapters.isNotEmpty,
+        _ => true,
+      };
+
+  bool _barButtonLit(String id) => switch (id) {
+        'bookmark' => _hasBookmarkAtCurrent,
+        'readalong' => _readAlongOn,
+        'autoscroll' => _autoScroll,
+        _ => false,
+      };
+
+  IconData _barButtonIcon(String id) => switch (id) {
+        'bookmark' => _hasBookmarkAtCurrent ? Icons.bookmark_rounded : Icons.bookmark_border_rounded,
+        'readalong' => Icons.graphic_eq_rounded,
+        'notes' => Icons.sticky_note_2_outlined,
+        'autoscroll' => Icons.swap_vert_rounded,
+        'chapters' => Icons.list_rounded,
+        _ => Icons.text_fields_rounded,
+      };
+
+  String _barButtonLabel(AppLocalizations l, String id) => switch (id) {
+        'bookmark' => l.bookmark,
+        'readalong' => l.readAlong,
+        'notes' => l.readerBarNotes,
+        'autoscroll' => l.readerAutoScroll,
+        'chapters' => l.chapters,
+        _ => l.readerSettings,
+      };
+
+  void _runBarButton(String id) {
+    switch (id) {
+      case 'chapters':
+        _showChapterList();
+      case 'bookmark':
+        _toggleBookmark();
+      case 'readalong':
+        _toggleReadAlong();
+      case 'notes':
+        _showAnnotationsSheet();
+      case 'autoscroll':
+        _toggleAutoScroll();
+      default:
+        _showSettingsSheet();
+    }
+  }
+
+  Widget _barButton(String id, Color fg, Color accent) {
+    final button = IconButton(
+      icon: Icon(_barButtonIcon(id), color: _barButtonLit(id) ? accent : fg),
+      // No tooltip on auto scroll: its long press opens the sleep timer.
+      tooltip: id == 'autoscroll' ? null : _barButtonLabel(AppLocalizations.of(context)!, id),
+      onPressed: () => _runBarButton(id),
+    );
+    if (id != 'autoscroll') return button;
+    return GestureDetector(onLongPress: _showAutoScrollSleepSheet, child: button);
+  }
+
+  Future<void> _updateTurnStyle(String style) async {
+    if (style == _turnStyle) return;
+    setState(() => _turnStyle = style);
+    _applyTurnStyle();
+    _refreshCurlShot();
+    await (await SharedPreferences.getInstance()).setString(_kTurnStyle, style);
+  }
+
+  EpubTheme _buildTheme(_ReaderPalette p) {
+    // No foregroundColor on purpose: all colors live in customCss. The
+    // plugin's loadBook ends with updateTheme(background, foreground) WITHOUT
+    // the customCss arg - if a foreground color is set, that call re-registers
+    // the theme with just a body color and wipes every customCss rule (text
+    // color inherit, line height, margins, scroll smoothness). With no colors
+    // passed, that wipe call builds zero rules and becomes a no-op, so the
+    // full theme from load survives and no post-load re-apply is needed.
+    final font = _font;
+    final body = <String, String>{
+      // !important so a book's own stylesheet can't override the reader theme
+      // (some books set their own body colors, which left the page white with
+      // black text regardless of the chosen theme).
+      'color': '${p.fg} !important',
+      'background': '${p.bg} !important',
+      'line-height': '$_lineHeight',
+      'padding': '${_marginV}px 0 !important',
+      'margin': '0px !important',
+      'box-sizing': 'border-box !important',
+      'max-width': '100vw !important',
+      'overflow-x': 'hidden !important',
+      '-webkit-overflow-scrolling': 'touch',
+      'will-change': 'scroll-position',
+    };
+    final textRule = <String, String>{'color': 'inherit !important'};
+    if (_alignLeft) {
+      body['text-align'] = 'left !important';
+      textRule['text-align'] = 'left !important';
+      textRule['text-align-last'] = 'left !important';
+    }
+    if (font.family.isNotEmpty) {
+      final fam = font.downloadable ? '"${font.family}"' : font.family;
+      body['font-family'] = '$fam !important';
+      textRule['font-family'] = '$fam !important';
+    }
+    return EpubTheme.custom(
+      backgroundDecoration: BoxDecoration(color: p.bgColor),
+      customCss: {
+        // Theme the root too: some books put a background on html (or leave body
+        // narrower than the page), which would otherwise show through white.
+        'html': {'background': '${p.bg} !important'},
+        'body': body,
+        'p, div, span, h1, h2, h3, h4, h5, h6, li, td, th, a, em, strong, blockquote': textRule,
+        // A picture with a fixed width wider than the page spilled past its
+        // column and showed on the next page as a strip down the left edge.
+        // Contain keeps a narrowed picture's shape without resizing small
+        // inline ones.
+        'img': {'max-width': '100% !important', 'object-fit': 'contain'},
+        if (_paragraphSpacing >= 0)
+          'p': {'margin-top': '0 !important', 'margin-bottom': '${_paragraphSpacing}em !important'},
+      },
+    );
+  }
+
+  void _applySettings() {
+    _epubController?.setFontSize(fontSize: _fontSize.toDouble());
+    _epubController?.updateTheme(theme: _buildTheme(_resolvePalette(context)));
+  }
+
+  Future<void> _updateFontSize(int size) async {
+    setState(() => _fontSize = size);
+    _epubController?.setFontSize(fontSize: size.toDouble());
+    await ScopedPrefs.setInt(_kFontSize, size);
+  }
+
+  Future<void> _updateLineHeight(double height) async {
+    setState(() => _lineHeight = height);
+    _applySettings();
+    await ScopedPrefs.setDouble(_kLineHeight, height);
+  }
+
+  Future<void> _updateAlignLeft(bool left) async {
+    setState(() => _alignLeft = left);
+    _applySettings();
+    await ScopedPrefs.setBool(_kAlignLeft, left);
+  }
+
+  Future<void> _updateMarginH(int margin) async {
+    // Side margins resize the WebView (handled in _buildViewerArea), so just
+    // rebuild - no CSS re-apply needed.
+    setState(() => _marginH = margin);
+    await ScopedPrefs.setInt(_kMarginH, margin);
+  }
+
+  /// The screen stays on while the setting, auto scroll or read along asks
+  /// for it. Every path that changes one of those ends here, and dispose
+  /// releases it outright since the platform never clears it on its own.
+  void _syncScreenWake() {
+    if (_screenWakeHeldOff) {
+      ScreenWake.hold('reader', false);
+      return;
+    }
+    ScreenWake.hold('reader', _keepAwake || _autoScroll || _readAlongOn);
+  }
+
+  /// The reader is being used again after the auto scroll sleep timer let
+  /// the screen go dark.
+  void _wakeScreenAgain() {
+    if (!_screenWakeHeldOff) return;
+    _screenWakeHeldOff = false;
+    _syncScreenWake();
+  }
+
+  Future<void> _updateKeepAwake(bool on) async {
+    if (on == _keepAwake) return;
+    setState(() => _keepAwake = on);
+    _syncScreenWake();
+    await ScopedPrefs.setBool(_kKeepAwake, on);
+  }
+
+  Future<void> _updateTopBarProgress(String mode) async {
+    if (mode == _topBarProgress) return;
+    setState(() => _topBarProgress = mode);
+    await ScopedPrefs.setString(_kTopBarProgress, mode);
+  }
+
+  Future<void> _updatePinTop(bool on) async {
+    if (on == _pinTop) return;
+    // The WebView gets shorter or taller, so epub.js re-paginates and
+    // re-seats the current page on its own, like a side margin change. The
+    // blind's live line has to be found again on the new page.
+    setState(() => _pinTop = on);
+    await ScopedPrefs.setBool(_kPinTop, on);
+    if (_autoScroll) {
+      Future.delayed(const Duration(milliseconds: 500), () async {
+        if (mounted && _autoScroll) await _epubController?.autoScrollResync();
+      });
+    }
+  }
+
+  Future<void> _updateMarginV(int margin) async {
+    setState(() => _marginV = margin);
+    _applySettings();
+    await ScopedPrefs.setInt(_kMarginV, margin);
+  }
+
+  @override
+  void dispose() {
+    _narrationSpotTimer?.cancel();
+    unawaited(_narrationCarryReadingSpot());
+    ReadListenSync.instance.readerClosed(widget.itemId, _currentCfi, moved: !_holdOpenSpot);
+    _rememberSpot(EbookSpotReason.closed);
+    _readingTimer?.cancel();
+    if (_logReading) unawaited(_sendReadingTime(closing: true));
+    _stopReadAlong();
+    _speedToast?.dismiss();
+    _autoScrollSleepTimer?.cancel();
+    if (_autoScroll) _epubController?.autoScrollStop();
+    ScreenWake.hold('reader', false);
+    _quietLib.setReaderQuiet(false);
+    WidgetsBinding.instance.removeObserver(this);
+    _volumeNav.detach();
+    _routeAnim?.removeStatusListener(_onRouteAnim);
+    PlayerSettings.settingsChanged.removeListener(_loadSkipSettings);
+    _pendingTapAction?.cancel();
+    _curlShotTimer?.cancel();
+    _controlsHideTimer?.cancel();
+    // Restore system UI when leaving
+    _setFullscreen(false);
+    super.dispose();
+  }
+
+  void _setFullscreen(bool fullscreen) {
+    if (fullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      // Explicitly show top + bottom bars. edgeToEdge alone doesn't reliably
+      // undo immersiveSticky on every Android version.
+      SystemChrome.setEnabledSystemUIMode(
+        SystemUiMode.manual,
+        overlays: SystemUiOverlay.values,
+      );
+    }
+  }
+
+  void _toggleControls() {
+    _wakeScreenAgain();
+    setState(() => _showControls = !_showControls);
+    _armControlsHide();
+  }
+
+  DateTime _lastReaderTap = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _pendingTapAction;
+  DateTime? _highlightTapAt;
+
+  /// Shared tap handler: left quarter = previous page, right quarter = next,
+  /// center = toggle controls, or whatever the tap grid says. [frac] and [fy]
+  /// are the tap's position 0..1 across and down the page. Debounced so the
+  /// touch and injected-click paths can't double-fire.
+  /// A tap on a highlight lands here too, and the markClicked event only
+  /// arrives from the WebView a beat later - so when the book has highlights
+  /// the action commits after a short grace window that the highlight tap can
+  /// cancel. No highlights, no added latency.
+  void _readerTapAt(double frac, double fy, String source) {
+    _wakeScreenAgain();
+    // While auto scroll runs, the in-WebView pad owns taps: pause, resume and
+    // press-and-hold to stop. This Listener sees raw pointers regardless of the
+    // platform view, so without this it turned pages under the blind.
+    if (_autoScroll) return;
+    final now = DateTime.now();
+    final sinceMs = now.difference(_lastReaderTap).inMilliseconds;
+    if (sinceMs < 350) {
+      debugPrint('[ReaderTap] DEBOUNCED frac=${frac.toStringAsFixed(2)} src=$source since=${sinceMs}ms');
+      return;
+    }
+    _lastReaderTap = now;
+    // In scroll mode the finger moves the page, so a tap only shows or hides
+    // the controls. Edge taps turn pages during read along too; the page then
+    // stops following the narration until you go back to it.
+    final action = _scroll ? 'menu' : _tapZones.actionAt(frac, fy);
+    debugPrint('[ReaderTap] frac=${frac.toStringAsFixed(2)},${fy.toStringAsFixed(2)} src=$source -> $action ctrl=${_epubController != null}');
+    final hasHighlights =
+        _annotations.any((a) => a.type == AnnotationType.highlight);
+    if (!hasHighlights) {
+      _commitReaderTap(action);
+      return;
+    }
+    _pendingTapAction?.cancel();
+    _pendingTapAction = Timer(const Duration(milliseconds: 140), () {
+      final markAt = _highlightTapAt;
+      if (markAt != null &&
+          DateTime.now().difference(markAt).inMilliseconds < 600) {
+        return;
+      }
+      _commitReaderTap(action);
+    });
+  }
+
+  void _commitReaderTap(String action) {
+    if (action == 'prev') {
+      _userMoved('tap');
+      _turnPage(false);
+    } else if (action == 'next') {
+      _userMoved('tap');
+      _turnPage(true);
+    } else if (action == 'menu') {
+      _toggleControls();
+    }
+  }
+
+  /// Turns the page the way the reader has chosen. The slide plays inside
+  /// the page itself; the curl is drawn here, over pictures of the page.
+  /// [fresh] pictures the page as it is right now rather than trusting the
+  /// one taken when it came up (read along recolors it as it goes).
+  Future<void> _turnPage(bool forward, {bool fresh = false}) async {
+    final c = _epubController;
+    if (c == null) return;
+    if (_curlOn && _curling && _curlDragForward == null && !_curlDragReady) {
+      // Quick taps each get their own turn: this one hurries along, and the
+      // next plays right after it rather than jumping the page.
+      if (_pendingTurns.length < 3) _pendingTurns.add(forward);
+      _curl.hurry();
+      return;
+    }
+    if (!_curlOn || _curling) {
+      // A turn in the middle of a drag stops it and turns at once.
+      if (_curling) _stopCurl();
+      forward ? c.next() : c.prev();
+      return;
+    }
+    final run = ++_curlRun;
+    _curling = true;
+    try {
+      final shot = (fresh ? null : _readyCurlShot) ?? await _pictureOfPage();
+      if (run != _curlRun) return;
+      if (shot == null) {
+        forward ? c.next() : c.prev();
+        return;
+      }
+      final origin = _turnOrigin(forward);
+      if (forward || _revealsUnder) {
+        _curl.show(shot, origin: origin, grabY: origin.dy);
+        // A curl lifts the page where it was touched.
+        if (_turnNow == 'curl') _curl.follow(Offset(max(origin.dx, _curl.size.width * 0.75), origin.dy));
+        await WidgetsBinding.instance.endOfFrame;
+        if (run != _curlRun) return;
+        forward ? c.next() : c.prev();
+        await _settleCurl(away: true);
+      } else {
+        final prev = await _turnUnderCurl(c, forward: false, cover: shot, run: run);
+        if (prev == null || run != _curlRun) return;
+        _curl.show(prev, under: shot, away: 1, origin: origin, grabY: origin.dy);
+        await _settleCurl(away: false);
+      }
+    } finally {
+      if (run == _curlRun) _endCurl();
+    }
+  }
+
+  /// Plays a turn out, quickly when more are waiting behind it.
+  Future<void> _settleCurl({required bool away}) {
+    final settling = _curl.settle(away: away);
+    if (_pendingTurns.isNotEmpty) _curl.hurry();
+    return settling;
+  }
+
+  void _stopCurl() {
+    _curlRun++;
+    _pendingTurns.clear();
+    _endCurl();
+  }
+
+  void _endCurl() {
+    _curling = false;
+    _curlDragReady = false;
+    _curl.hide();
+    _queueCurlShot();
+    if (_pendingTurns.isNotEmpty) unawaited(_turnPage(_pendingTurns.removeAt(0), fresh: true));
+  }
+
+  /// Turns the real page under a picture of this one, then pictures the page
+  /// it came to. Null when the page didn't move (the start or end of the
+  /// book).
+  Future<ui.Image?> _turnUnderCurl(EpubController c,
+      {required bool forward, required ui.Image cover, required int run}) async {
+    _curl.show(cover);
+    await WidgetsBinding.instance.endOfFrame;
+    if (run != _curlRun) return null;
+    if (!await _turnUnderCover(c, forward, run)) return null;
+    return _pictureOfPage();
+  }
+
+  /// Turns the real page while a picture covers it, and waits for it to land.
+  Future<bool> _turnUnderCover(EpubController c, bool forward, int run) async {
+    final landed = _curlLanded = Completer<bool>();
+    forward ? c.next() : c.prev();
+    final moved = await landed.future.timeout(const Duration(milliseconds: 700), onTimeout: () => false);
+    if (identical(_curlLanded, landed)) _curlLanded = null;
+    if (!moved || run != _curlRun) return false;
+    // Let the page paint before it is pictured.
+    await Future.delayed(const Duration(milliseconds: 40));
+    return run == _curlRun;
+  }
+
+  Future<ui.Image?> _pictureOfPage() async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return null;
+    final started = DateTime.now();
+    try {
+      final bytes = await wc.takeScreenshot(
+          screenshotConfiguration: ScreenshotConfiguration(compressFormat: CompressFormat.JPEG, quality: 92));
+      if (bytes == null || bytes.isEmpty) return null;
+      final codec = await ui.instantiateImageCodec(bytes);
+      final image = (await codec.getNextFrame()).image;
+      debugPrint('[PageCurl] pictured the page in ${DateTime.now().difference(started).inMilliseconds}ms '
+          '(${image.width}x${image.height})');
+      return image;
+    } catch (e) {
+      debugPrint('[PageCurl] could not picture the page: $e');
+      return null;
+    }
+  }
+
+  ui.Image? get _readyCurlShot => _curlShotCfi != null && _curlShotCfi == _currentCfi ? _curlShot : null;
+
+  /// Pictures the page once it has settled, so the next curl starts at once.
+  void _queueCurlShot() {
+    if (!_curlOn) return;
+    _curlShotTimer?.cancel();
+    _curlShotTimer = Timer(const Duration(milliseconds: 300), () async {
+      if (!mounted || _curling || !_curlOn) return;
+      final cfi = _currentCfi;
+      final shot = await _pictureOfPage();
+      if (shot == null || !mounted || _curling || _currentCfi != cfi) return;
+      _curlShot = shot;
+      _curlShotCfi = cfi;
+    });
+  }
+
+  /// The page looks different now (a highlight, the theme, the font).
+  void _refreshCurlShot() {
+    _curlShotCfi = null;
+    _curlShot = null;
+    _queueCurlShot();
+  }
+
+  void _curlDragDown(PointerDownEvent e) {
+    if (_curlPointer != null) {
+      // A second finger: a pinch or a slip, not a turn.
+      if (_curlDragForward == null) _curlDownAt = null;
+      return;
+    }
+    _curlPointer = e.pointer;
+    _lastPointerAt = e.localPosition + _curlInset.topLeft;
+    _lastPointerTime = DateTime.now();
+    _curlDownAt = _curlOn && !_curling && _selectionText == null ? e.localPosition : null;
+    _curlDownTime = DateTime.now();
+    _curlDragForward = null;
+    _curlDragDecision = null;
+    _curlDragTrack.clear();
+  }
+
+  void _curlDragMove(PointerMoveEvent e) {
+    final down = _curlDownAt;
+    if (down == null || e.pointer != _curlPointer) return;
+    final d = e.localPosition - down;
+    final at = e.localPosition + _curlInset.topLeft;
+    if (_curlDragForward == null) {
+      if (d.dx.abs() < 14 || d.dx.abs() < d.dy.abs() * 1.2) {
+        if (d.dy.abs() > 14) _curlDownAt = null;
+        return;
+      }
+      // A finger that rested before moving was pressing to select text.
+      if (_selectionText != null || DateTime.now().difference(_curlDownTime) > const Duration(milliseconds: 400)) {
+        _curlDownAt = null;
+        return;
+      }
+      _curlDragForward = d.dx < 0;
+      _curlDragLast = at;
+      _curlDragStart = down + _curlInset.topLeft;
+      unawaited(_startCurlDrag(_curlDragForward!, down + _curlInset.topLeft));
+    }
+    _curlDragLast = at;
+    _curlDragTrack.add((e.timeStamp, at.dx));
+    if (_curlDragTrack.length > 6) _curlDragTrack.removeAt(0);
+    if (_curlDragReady) _curl.follow(_curlDragPoint(_curlDragForward!, at));
+  }
+
+  /// Pulling back, the fold follows the finger rather than the page's edge,
+  /// so the page comes in from the left instead of half of it at once. The
+  /// other drawn turns go by how far across the page the finger has come.
+  Offset _curlDragPoint(bool forward, Offset at) {
+    final w = _curl.size.width;
+    if (_turnNow == 'curl') return forward ? at : Offset(2 * at.dx - w, at.dy);
+    final away =
+        ((forward ? _curlDragStart.dx - at.dx : at.dx - _curlDragStart.dx) / (w * 0.8)).clamp(0.0, 1.0);
+    return Offset(w - 2 * w * away, at.dy);
+  }
+
+  Future<void> _startCurlDrag(bool forward, Offset start) async {
+    final c = _epubController;
+    if (c == null) return;
+    final run = ++_curlRun;
+    _curling = true;
+    _curlDragReady = false;
+    final shot = _readyCurlShot ?? await _pictureOfPage();
+    if (run != _curlRun) return;
+    if (shot == null) {
+      _endCurl();
+      forward ? c.next() : c.prev();
+      return;
+    }
+    if (forward || _revealsUnder) {
+      _curl.show(shot, grabY: start.dy, origin: start);
+      await WidgetsBinding.instance.endOfFrame;
+      if (run != _curlRun) return;
+      forward ? c.next() : c.prev();
+    } else {
+      final prev = await _turnUnderCurl(c, forward: false, cover: shot, run: run);
+      if (run != _curlRun) return;
+      if (prev == null) {
+        _endCurl();
+        return;
+      }
+      _curl.show(prev, under: shot, away: 1, grabY: start.dy, origin: start);
+    }
+    _curlDragReady = true;
+    final decided = _curlDragDecision;
+    if (decided != null) {
+      unawaited(_endCurlDrag(forward, decided, run));
+    } else {
+      _curl.follow(_curlDragPoint(forward, _curlDragLast));
+    }
+  }
+
+  /// True when the finger was curling the page, so it isn't also a tap.
+  bool _curlDragUp(PointerEvent e, {bool cancelled = false}) {
+    if (e.pointer == _curlPointer) _curlPointer = null;
+    final forward = _curlDragForward;
+    final down = _curlDownAt;
+    _curlDownAt = null;
+    if (forward == null || down == null) return false;
+    _curlDragForward = null;
+    final w = _curl.size.width;
+    final moved = _curlDragLast.dx - (down.dx + _curlInset.left);
+    var speed = 0.0;
+    if (_curlDragTrack.length > 1) {
+      final (t0, x0) = _curlDragTrack.first;
+      final (t1, x1) = _curlDragTrack.last;
+      final ms = (t1 - t0).inMicroseconds / 1000.0;
+      if (ms > 0) speed = (x1 - x0) / ms * 1000;
+    }
+    final complete = !cancelled &&
+        (forward ? (moved < -w * 0.18 || speed < -500) : (moved > w * 0.18 || speed > 500));
+    _curlDragDecision = complete;
+    if (_curlDragReady) unawaited(_endCurlDrag(forward, complete, _curlRun));
+    return true;
+  }
+
+  Future<void> _endCurlDrag(bool forward, bool complete, int run) async {
+    final c = _epubController;
+    _curlDragReady = false;
+    try {
+      // The picture is this page with the real page turned under it, except
+      // for a curl going back: then it is the page before, and the real page
+      // is already on it.
+      await _curl.settle(away: forward || _revealsUnder ? complete : !complete);
+      if (run != _curlRun || complete || c == null) return;
+      await _turnUnderCover(c, !forward, run);
+    } finally {
+      if (run == _curlRun) _endCurl();
+    }
+  }
+
+  /// epub.js touch callbacks don't fire on iOS, so inject our own click
+  /// listener into each rendered section and route it to a handler we register
+  /// (the same callHandler bridge the selection menu uses). Skips taps while
+  /// text is selected so highlighting still works.
+  void _setupTapHandler() {
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbReaderTap',
+      callback: (args) {
+        final frac = args.isNotEmpty ? (args[0] as num?)?.toDouble() : null;
+        final src = args.length > 1 ? '${args[1]}' : 'js';
+        final fy = args.length > 2 ? (args[2] as num?)?.toDouble() : null;
+        if (frac != null) _readerTapAt(frac.clamp(0.0, 1.0), (fy ?? 0.5).clamp(0.0, 1.0), 'js:$src');
+      },
+    );
+    _epubController?.webViewController?.evaluateJavascript(source: '''
+      (function(){
+        if (window.__absorbTapInit) return;
+        window.__absorbTapInit = true;
+        function send(frac, kind, fy){
+          try { if(window.flutter_inappwebview){ window.flutter_inappwebview.callHandler('absorbReaderTap', frac, kind, fy); return; } } catch(e){}
+          try { if(window.parent && window.parent.flutter_inappwebview){ window.parent.flutter_inappwebview.callHandler('absorbReaderTap', frac, kind, fy); } } catch(e){}
+        }
+        function onTap(e, kind){
+          try {
+            var win = e.view || window;
+            var sel = win.getSelection ? win.getSelection() : null;
+            if (sel && String(sel).length > 0) return; // selecting text, not a tap
+            var w = win.innerWidth || window.innerWidth;
+            if (!w) return;
+            var cx = (e.clientX != null) ? e.clientX
+              : (e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientX : null);
+            if (cx == null) return;
+            var h = win.innerHeight || window.innerHeight;
+            var cy = (e.clientY != null) ? e.clientY
+              : (e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientY : null);
+            send(cx / w, kind, h && cy != null ? cy / h : 0.5);
+          } catch(err){}
+        }
+        function attach(doc){
+          try {
+            // Track the touch start and whether the gesture became a drag, so a
+            // swipe doesn't fall through to a center-tap (menu toggle) on release.
+            var _tsx=null,_tsy=null,_dragged=false;
+            doc.addEventListener('touchstart',function(e){
+              if(e.touches.length===1){_tsx=e.touches[0].clientX;_tsy=e.touches[0].clientY;_dragged=false;}
+              else{_tsx=null;}
+            },{passive:true});
+            // In scroll mode nothing moves sideways, and a listener that can
+            // cancel makes every scroll wait on this script.
+            var scrolled=document.body.classList.contains('absorb-scrolled');
+            doc.addEventListener('touchmove',function(e){
+              if(_tsx==null)return;
+              var dx=Math.abs(e.touches[0].clientX-_tsx),dy=Math.abs(e.touches[0].clientY-_tsy);
+              if(dx>10||dy>10)_dragged=true;
+              // Swallow horizontal drags so epub.js can't partially scroll the column.
+              if(dx>dy&&!scrolled)e.preventDefault();
+            },{passive:scrolled});
+            function onTapGuarded(e,kind){
+              if(_dragged){ if(kind==='touchend')_dragged=false; return; }
+              onTap(e,kind);
+            }
+            doc.addEventListener('click', function(e){ onTapGuarded(e,'click'); }, true);
+            doc.addEventListener('pointerup', function(e){ onTapGuarded(e,'pointerup'); }, true);
+            doc.addEventListener('touchend', function(e){ onTapGuarded(e,'touchend'); }, true);
+          } catch(e){}
+        }
+        try { rendition.getContents().forEach(function(c){ attach(c.document); }); } catch(e){}
+        try { rendition.hooks.content.register(function(contents){ attach(contents.document); }); } catch(e){}
+      })();
+    ''');
+  }
+
+  void _loadInitialLocation() {
+    final lib = context.read<LibraryProvider>();
+    // A highlight jump wins over the saved reading position; the percent below
+    // still comes from saved progress so the bar isn't at 0 until epub.js has
+    // indexed locations.
+    final target = widget.openAtCfi;
+    if (target != null && target.isNotEmpty) {
+      _initialCfi = pointCfi(target);
+      _settleJumpCfi = _initialCfi;
+    }
+    if (_otherAccount) return;
+    final progressData = lib.getProgressData(widget.itemId);
+    final loc = progressData?['ebookLocation'] as String?;
+    // Seed the displayed percent from saved progress so the bar shows the
+    // resume position until epub.js's location index is ready, and so the
+    // pre-index save keeps this value instead of regressing to 0.
+    final savedProgress = (progressData?['ebookProgress'] as num?)?.toDouble();
+    if (savedProgress != null) _progress = savedProgress.clamp(0.0, 1.0);
+    if (_initialCfi == null && loc != null && loc.isNotEmpty) {
+      // Only an epub CFI can be opened directly, the same check the ABS web
+      // reader makes. Anything else in this field came from another app.
+      if (loc.startsWith('epubcfi(')) {
+        _initialCfi = loc;
+      } else {
+        debugPrint('[EbookReader] saved location is not a CFI '
+            '(${loc.length} chars, starts "${loc.substring(0, min(10, loc.length))}") '
+            'item=${widget.itemId} - opening at saved percent=$savedProgress');
+        if (savedProgress != null && savedProgress > 0) {
+          _pendingPercentJump = savedProgress.clamp(0.0, 1.0);
+        }
+      }
+    } else if (_initialCfi == null && savedProgress != null && savedProgress > 0 && savedProgress < 1) {
+      // A percent with no place to go with it: open there rather than at
+      // the start, which would then be saved over the real spot.
+      _pendingPercentJump = savedProgress;
+    }
+  }
+
+  /// The file is on the device now, but the offline lists only know records.
+  /// An ebook-only book becomes a download record; a book with audio gets a
+  /// kept ebook record, so the copy outlives the audio download.
+  Future<void> _rememberForOffline(ApiService api) async {
+    final downloads = DownloadService();
+    if (!downloads.isDownloaded(widget.itemId)) {
+      final registered = await downloads.registerEbookDownload(
+        api: api,
+        itemId: widget.itemId,
+        onlyIfNoAudio: true,
+      );
+      if (registered) return;
+    }
+    await downloads.keepEbook(api: api, itemId: widget.itemId);
+  }
+
+  /// Takes the server's place in the book when it differs from the phone's:
+  /// the web reader or another device may have moved on, and a BookOrbit
+  /// library refresh carries no ebook position at all, which left the reader
+  /// starting over and then saving the start on top of the real spot. A place
+  /// this phone hasn't sent yet wins unless the server's ebook place is newer,
+  /// and a slow server keeps the phone's.
+  Future<void> _pullServerPosition(ApiService api) async {
+    if (widget.openAtCfi != null || !mounted) return;
+    final lib = context.read<LibraryProvider>();
+    if (lib.isOffline) return;
+    try {
+      final pending =
+          (await ProgressSyncService().getPendingEbookProgress())[widget.itemId];
+      final server = await api
+          .getEbookPosition(widget.itemId)
+          .timeout(const Duration(seconds: 6), onTimeout: () {
+        debugPrint('[EbookReader] server position check timed out item=${widget.itemId}');
+        return null;
+      });
+      if (!mounted || server == null) return;
+      if (pending != null) {
+        final serverAt = (server['ebookUpdatedAt'] as num?)?.toInt();
+        final pendingAt = (pending['ts'] as num?)?.toInt();
+        if (serverAt == null || pendingAt == null || pendingAt >= serverAt) return;
+        debugPrint('[EbookReader] dropping the queued place for item=${widget.itemId}: '
+            'the server moved on after it');
+        await ProgressSyncService().dropPendingEbookProgress(widget.itemId);
+        if (!mounted) return;
+      }
+      final loc = server['ebookLocation'] as String?;
+      final serverProgress = (server['ebookProgress'] as num?)?.toDouble();
+      final local = lib.getProgressData(widget.itemId);
+      if (loc == null || !loc.startsWith('epubcfi(')) {
+        // Kobo and KOReader leave a percent with no CFI: open there rather
+        // than at the phone's older place or the start.
+        if (serverProgress == null || serverProgress <= 0 || serverProgress >= 1) return;
+        final localProgress = (local?['ebookProgress'] as num?)?.toDouble();
+        if (localProgress != null && (localProgress - serverProgress).abs() < 0.005) return;
+        debugPrint('[EbookReader] taking the server percent item=${widget.itemId} '
+            'pct=$serverProgress (no CFI)');
+        _initialCfi = null;
+        _progress = serverProgress;
+        _pendingPercentJump = serverProgress;
+        return;
+      }
+      if (local?['ebookLocation'] == loc) return;
+      final progress = serverProgress ??
+          (local?['ebookProgress'] as num?)?.toDouble() ??
+          0;
+      debugPrint('[EbookReader] taking the server position item=${widget.itemId} '
+          '(phone had ${local?['ebookLocation'] == null ? 'none' : 'another'})');
+      lib.applyLocalEbookProgress(widget.itemId, location: loc, progress: progress);
+      _initialCfi = null;
+      _pendingPercentJump = null;
+      _loadInitialLocation();
+    } catch (e) {
+      debugPrint('[EbookReader] server position check failed: $e');
+    }
+  }
+
+  Future<void> _downloadAndOpen() async {
+    try {
+      final auth = context.read<AuthProvider>();
+      final api = auth.apiService;
+      if (api == null) {
+        setState(() { _error = '未连接到服务器'; _loading = false; });
+        return;
+      }
+      // Shared persistent cache - reuses a downloaded/previously-opened copy so
+      // the book reads offline.
+      final playing = AudioPlayerService().isPlaying;
+      debugPrint('[EbookReader] open item=${widget.itemId} ext=${ebookExtFromFile(widget.ebookFile)} '
+          'cached=${await isEbookCached(widget.itemId, widget.ebookFile)} playing=$playing');
+      // Asked while the file downloads, so a slow answer costs no extra wait.
+      final serverSpot = _otherAccount ? null : _pullServerPosition(api);
+      final file = await NarrationService.instance
+          .readerFile(api, widget.itemId, widget.ebookFile, widget.title);
+      _narrationLookup = _loadNarration(api, file);
+      unawaited(_narrationLookup);
+      if (_otherAccount) {
+        await _restoreOtherAccountSpot();
+      } else {
+        unawaited(_rememberForOffline(api));
+        await serverSpot;
+      }
+      final len = file.existsSync() ? await file.length() : 0;
+      final locations = await loadCachedLocations(file);
+      debugPrint('[EbookReader] file ready item=${widget.itemId} bytes=$len '
+          'locations=${locations == null ? 'none' : 'cached'} path=${file.path}');
+      if (mounted) {
+        setState(() {
+          _cachedFile = file;
+          _cachedLocations = locations;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('[EbookReader] Error: $e');
+      if (mounted) {
+        setState(() { _error = '加载电子书出错：$e'; _loading = false; });
+      }
+    }
+  }
+
+  DateTime _ebookPushAt = DateTime.fromMillisecondsSinceEpoch(0);
+  (String, double)? _ebookPushPending;
+  Timer? _ebookPushTimer;
+  ApiService? _ebookPushApi;
+
+  Future<void> _restoreOtherAccountSpot() async {
+    debugPrint('[EbookReader] item=${widget.itemId} is another account\'s download - '
+        'its place stays on this phone');
+    final spot = await DownloadService().otherAccountReadingSpot(widget.itemId);
+    if (spot == null || !mounted) return;
+    _progress = spot.progress.clamp(0.0, 1.0);
+    if (_initialCfi != null) return;
+    if (spot.location.startsWith('epubcfi(')) {
+      _initialCfi = spot.location;
+    } else if (spot.progress > 0 && spot.progress < 1) {
+      _pendingPercentJump = spot.progress;
+    }
+  }
+
+  void _syncProgress(String cfi, double progress) {
+    _readingActiveAt = DateTime.now();
+    // Read along and auto scroll move the page on their own; those count.
+    if (_readAlongOn || _autoScroll) _holdOpenSpot = false;
+    if (_holdOpenSpot) return;
+    if (_useNarration && !_readAlongOn) _noteNarrationSpot();
+    if (_otherAccount) {
+      unawaited(DownloadService().saveOtherAccountReadingSpot(widget.itemId, cfi, progress));
+      return;
+    }
+    final auth = context.read<AuthProvider>();
+    final api = auth.apiService;
+    if (api == null) return;
+    _ebookPushApi = api;
+    context.read<LibraryProvider>().applyLocalEbookProgress(
+      widget.itemId, location: cfi, progress: progress);
+    // Read along turns the pages itself, several times a minute and in
+    // bursts while a page settles. One server write every 15s is plenty for
+    // that; the latest position wins and whatever is pending goes out when
+    // read along stops.
+    if (_readAlongOn) {
+      _ebookPushPending = (cfi, progress);
+      final since = DateTime.now().difference(_ebookPushAt);
+      if (since < const Duration(seconds: 15)) {
+        _ebookPushTimer ??=
+            Timer(const Duration(seconds: 15) - since, _flushEbookPush);
+        return;
+      }
+      _ebookPushPending = null;
+    }
+    _ebookPushAt = DateTime.now();
+    ProgressSyncService().pushEbookProgress(
+      api,
+      widget.itemId,
+      location: cfi,
+      progress: progress,
+    );
+  }
+
+  void _flushEbookPush() {
+    _ebookPushTimer?.cancel();
+    _ebookPushTimer = null;
+    final pending = _ebookPushPending;
+    final api = _ebookPushApi;
+    if (pending == null || api == null) return;
+    _ebookPushPending = null;
+    _ebookPushAt = DateTime.now();
+    ProgressSyncService().pushEbookProgress(
+      api,
+      widget.itemId,
+      location: pending.$1,
+      progress: pending.$2,
+    );
+  }
+
+  Future<void> _loadAnnotations() async {
+    _annotations = await _annotationService.getAnnotations(widget.itemId);
+    if (mounted) setState(() {});
+  }
+
+  void _restoreHighlights() {
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbCfiText',
+      callback: (args) {
+        final cfi = args.isNotEmpty ? '${args[0]}' : '';
+        final resolved = args.length > 1 ? '${args[1]}' : '';
+        String? stored;
+        for (final x in _annotations) {
+          if (x.cfi == cfi) {
+            stored = x.selectedText;
+            break;
+          }
+        }
+        String cut(String? s) {
+          final t = (s ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+          return t.length <= 60 ? t : '${t.substring(0, 60)}...';
+        }
+        debugPrint('[Highlight] cfi check stored="${cut(stored)}" '
+            'resolves="${cut(resolved)}" cfi=$cfi');
+      },
+    );
+    for (final a in _annotations) {
+      if (a.type == AnnotationType.highlight && a.color != null) {
+        _epubController?.addHighlight(
+          cfi: a.cfi,
+          color: Color(int.parse('FF${a.color!.hex.substring(1)}', radix: 16)),
+          opacity: 0.35,
+        );
+        _probeHighlightCfi(a.cfi);
+      }
+    }
+    // The layout is still settling when these first draw (load-rescue and
+    // settle re-displays, font apply), and the boxes don't follow the text
+    // when it moves - repaint once things calm down.
+    Future.delayed(const Duration(milliseconds: 900),
+        () { if (mounted) _repaintHighlightMarks(); });
+    Future.delayed(const Duration(milliseconds: 2600),
+        () { if (mounted) _repaintHighlightMarks(); });
+  }
+
+  /// Highlight boxes are computed once when the mark is drawn; a reflow after
+  /// that (font swap, re-display) moves the text out from under them, which
+  /// painted synced highlights a few lines away from their own text. The marks
+  /// keep live DOM ranges, so re-rendering the panes puts every box back.
+  void _repaintHighlightMarks() {
+    _refreshCurlShot();
+    if (!_annotations.any((a) => a.type == AnnotationType.highlight)) return;
+    _epubController?.webViewController?.evaluateJavascript(source: '''
+      try {
+        requestAnimationFrame(function(){
+          try {
+            rendition.manager.views.forEach(function(v){
+              try { if (v && v.pane) v.pane.render(); } catch(e){}
+            });
+          } catch(e){}
+        });
+      } catch(e){}
+    ''');
+  }
+
+  /// Debug probe: resolve a stored highlight cfi against this device's copy of
+  /// the epub (book.getRange works off the archive, no rendering involved) and
+  /// log the text it lands on, so cross-device drift shows up in the log.
+  void _probeHighlightCfi(String cfi) {
+    final esc = jsonEncode(cfi);
+    _epubController?.webViewController?.evaluateJavascript(source: '''
+      try {
+        book.getRange($esc).then(function(r){
+          window.flutter_inappwebview.callHandler('absorbCfiText', $esc, r ? r.toString() : '(null range)');
+        }).catch(function(e){
+          window.flutter_inappwebview.callHandler('absorbCfiText', $esc, '(error: ' + e + ')');
+        });
+      } catch(e) {
+        try { window.flutter_inappwebview.callHandler('absorbCfiText', $esc, '(error: ' + e + ')'); } catch(_){}
+      }
+    ''');
+  }
+
+  void _setupPageInfoHandler() {
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'pageInfo',
+      callback: (args) {
+        if (!mounted || args.isEmpty) return;
+        final data = args[0] as Map<String, dynamic>?;
+        if (data == null) return;
+        final page = data['page'] as int? ?? 0;
+        final total = data['total'] as int? ?? 0;
+        final href = data['href'] as String? ?? '';
+        // Resolve the current section to its chapter title; keep the last one
+        // if this section isn't in the TOC.
+        final chapter = href.isNotEmpty
+            ? (_chapterForHref(href) ?? _currentChapterTitle)
+            : _currentChapterTitle;
+        // Brief total=0 reports happen at chapter handoffs; keep the last
+        // valid count visible rather than blanking the indicator.
+        if (total == 0 && _chapterPageTotal > 0) return;
+        if (page != _chapterPage ||
+            total != _chapterPageTotal ||
+            chapter != _currentChapterTitle) {
+          setState(() {
+            _chapterPage = page;
+            _chapterPageTotal = total;
+            _currentChapterTitle = chapter;
+          });
+        }
+      },
+    );
+    _epubController?.webViewController?.evaluateJavascript(
+      source: '''
+        (function() {
+          rendition.on('relocated', function(location) {
+            var info = (typeof readerPageInfo === 'function') ? readerPageInfo() : null;
+            if (!info && location && location.start && location.start.displayed) {
+              info = {
+                page: location.start.displayed.page,
+                total: location.start.displayed.total,
+                href: location.start.href || ''
+              };
+            }
+            if (info) window.flutter_inappwebview.callHandler('pageInfo', info);
+          });
+        })();
+      ''',
+    );
+  }
+
+  Future<void> _addHighlight(HighlightColor color) async {
+    if (_selectionCfi == null || _selectionText == null) return;
+    final annotation = await _annotationService.addHighlight(
+      itemId: widget.itemId,
+      cfi: _selectionCfi!,
+      selectedText: _selectionText!,
+      color: color,
+      chapter: _currentChapterTitle,
+    );
+    _epubController?.addHighlight(
+      cfi: annotation.cfi,
+      color: Color(int.parse('FF${color.hex.substring(1)}', radix: 16)),
+      opacity: 0.35,
+    );
+    _annotations.insert(0, annotation);
+    if (mounted) _dismissSelection();
+  }
+
+  /// [onThisPage] is for a highlight tapped in the book: the reader is sitting
+  /// in its chapter, so an older highlight with no recorded chapter can borrow
+  /// the current one. From the list it would be a guess, so it stays blank.
+  Future<void> _shareHighlight(EbookAnnotation annotation,
+      {bool onThisPage = false}) async {
+    final text = annotation.selectedText ?? '';
+    if (text.isEmpty) return;
+    await showQuoteShareSheet(
+      context,
+      itemId: widget.itemId,
+      quote: text,
+      bookTitle: widget.title,
+      author: _audioAuthor.isEmpty ? null : _audioAuthor,
+      chapter: annotation.chapter ?? (onThisPage ? _currentChapterTitle : null),
+    );
+  }
+
+  Future<void> _removeHighlight(EbookAnnotation annotation) async {
+    _epubController?.removeHighlight(cfi: annotation.cfi);
+    await _annotationService.delete(
+      itemId: widget.itemId,
+      annotationId: annotation.id,
+    );
+    _annotations.removeWhere((a) => a.id == annotation.id);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _changeHighlightColor(
+      EbookAnnotation annotation, HighlightColor color) async {
+    if (annotation.color == color) return;
+    await _annotationService.updateColor(
+      itemId: widget.itemId,
+      annotationId: annotation.id,
+      color: color,
+    );
+    annotation.color = color;
+    _epubController?.removeHighlight(cfi: annotation.cfi);
+    _epubController?.addHighlight(
+      cfi: annotation.cfi,
+      color: Color(int.parse('FF${color.hex.substring(1)}', radix: 16)),
+      opacity: 0.35,
+    );
+    if (mounted) setState(() {});
+  }
+
+  /// A highlight tapped on the page: cancel the pending page turn and open
+  /// its menu. Transient flash highlights (find/search jumps) have no stored
+  /// annotation, so they fall through to the normal tap.
+  void _onHighlightTapped(String cfiRange) {
+    debugPrint('[Highlight] markClicked cfi=$cfiRange');
+    EbookAnnotation? match;
+    for (final a in _annotations) {
+      if (a.type == AnnotationType.highlight && a.cfi == cfiRange) {
+        match = a;
+        break;
+      }
+    }
+    if (match == null) {
+      final stored = _annotations
+          .where((a) => a.type == AnnotationType.highlight)
+          .map((a) => a.cfi)
+          .toList();
+      debugPrint('[Highlight] no stored annotation for tapped cfi '
+          '(${stored.length} stored${stored.length <= 8 ? ': ${stored.join(' | ')}' : ''}) '
+          '- treating as normal tap');
+      return;
+    }
+    // epub.js dispatches the mark's click emitter on both touchstart and
+    // click, so one tap arrives here twice - keep the page turn cancelled
+    // but only open the menu once.
+    final now = DateTime.now();
+    final last = _highlightTapAt;
+    _highlightTapAt = now;
+    _pendingTapAction?.cancel();
+    if (last != null && now.difference(last).inMilliseconds < 600) {
+      debugPrint('[Highlight] duplicate markClicked ignored');
+      return;
+    }
+    debugPrint('[Highlight] opening menu for annotation ${match.id}');
+    _showHighlightMenu(match);
+  }
+
+  Future<void> _showHighlightMenu(EbookAnnotation annotation) async {
+    final l = AppLocalizations.of(context)!;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        final tt = Theme.of(ctx).textTheme;
+        return SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 14),
+              child: Text('"${annotation.selectedText ?? ''}"',
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: tt.bodyMedium?.copyWith(
+                      color: cs.onSurfaceVariant, fontStyle: FontStyle.italic)),
+            ),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              for (final c in HighlightColor.values)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: GestureDetector(
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _changeHighlightColor(annotation, c);
+                    },
+                    child: Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        color: Color(
+                            int.parse('FF${c.hex.substring(1)}', radix: 16)),
+                        shape: BoxShape.circle,
+                        border: annotation.color == c
+                            ? Border.all(color: cs.onSurface, width: 2.5)
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+            ]),
+            const SizedBox(height: 8),
+            ListTile(
+              leading: Icon(Icons.edit_note_rounded, color: cs.onSurfaceVariant),
+              title: Text(
+                  annotation.note?.isNotEmpty == true ? l.editNote : l.newNote),
+              onTap: () {
+                Navigator.pop(ctx);
+                _addNoteToAnnotation(annotation);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.ios_share_rounded, color: cs.onSurfaceVariant),
+              title: Text(l.quoteShareAction),
+              onTap: () {
+                Navigator.pop(ctx);
+                _shareHighlight(annotation, onThisPage: true);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.headphones_rounded, color: cs.onSurfaceVariant),
+              title: Text(l.findInAudiobook),
+              onTap: () {
+                Navigator.pop(ctx);
+                _findInAudiobookFromSelection(
+                  cfiOverride: annotation.cfi,
+                  textOverride: annotation.selectedText ?? '',
+                );
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.delete_outline_rounded, color: cs.error),
+              title: Text(l.remove, style: TextStyle(color: cs.error)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _removeHighlight(annotation);
+              },
+            ),
+            const SizedBox(height: 8),
+          ]),
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleBookmark() async {
+    final cfi = _currentCfi;
+    if (cfi == null) return;
+
+    if (_hasBookmarkAtCurrent) {
+      // Remove existing bookmark at this location
+      final existing = _annotations.where(
+        (a) => a.type == AnnotationType.bookmark && a.cfi == cfi,
+      ).toList();
+      for (final bm in existing) {
+        await _annotationService.delete(
+          itemId: widget.itemId,
+          annotationId: bm.id,
+        );
+        _annotations.removeWhere((a) => a.id == bm.id);
+      }
+    } else {
+      final annotation = await _annotationService.addBookmark(
+        itemId: widget.itemId,
+        cfi: cfi,
+        chapter: _currentChapterTitle,
+      );
+      _annotations.insert(0, annotation);
+    }
+    _updateBookmarkState();
+    if (mounted) setState(() {});
+  }
+
+  void _updateBookmarkState() {
+    final cfi = _currentCfi;
+    _hasBookmarkAtCurrent = cfi != null &&
+        _annotations.any((a) => a.type == AnnotationType.bookmark && a.cfi == cfi);
+  }
+
+  void _clearSelection() {
+    _selectionText = null;
+    _selectionCfi = null;
+    _selectionRect = null;
+  }
+
+  /// Clears both our toolbar state and the WebView's native selection. The
+  /// plugin's JS blocks page-turn taps while a selection is active, so leaving
+  /// the native selection behind locks the user on the page.
+  void _dismissSelection() {
+    _epubController?.clearSelection();
+    setState(() => _clearSelection());
+  }
+
+  Widget _divider(ColorScheme cs) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 2),
+    child: Container(width: 1, height: 24, color: cs.onSurface.withValues(alpha: 0.15)),
+  );
+
+  void _copySelection() {
+    if (_selectionText == null) return;
+    Clipboard.setData(ClipboardData(text: _selectionText!));
+    _dismissSelection();
+    showOverlayToast(context, AppLocalizations.of(context)!.readerCopied,
+        icon: Icons.content_copy_rounded);
+  }
+
+  void _searchSelection() {
+    if (_selectionText == null) return;
+    final query = Uri.encodeComponent(_selectionText!.trim());
+    launchUrl(Uri.parse('https://www.google.com/search?q=$query'), mode: LaunchMode.externalApplication);
+    _dismissSelection();
+  }
+
+  Future<void> _defineSelection() async {
+    if (_selectionText == null) return;
+    // Strip surrounding punctuation so selecting "dragon," still looks up
+    // "dragon"; multi-word selections look up their first word.
+    final word = _selectionText!
+        .trim()
+        .split(RegExp(r'\s+'))
+        .first
+        .replaceAll(RegExp(r'''^[^\w'-]+|[^\w'-]+$'''), '');
+    _dismissSelection();
+    if (word.isEmpty) return;
+    // The platform dictionary first (offline, any language); the in-app
+    // English lookup sheet only when the device has nothing to offer.
+    if (await NativeDictionary.define(word)) return;
+    if (mounted) showDictionarySheet(context, word);
+  }
+
+  void _onSelection(String text, String cfi, Rect selRect, Rect vRect) {
+    if (text.trim().isEmpty) return;
+    setState(() {
+      _selectionText = text;
+      _selectionCfi = cfi;
+      _selectionRect = selRect;
+    });
+  }
+
+  Future<void> _addNoteToAnnotation(EbookAnnotation annotation) async {
+    final controller = TextEditingController(text: annotation.note ?? '');
+    final l = AppLocalizations.of(context)!;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(children: [
+          Expanded(child: Text(l.readerNoteTitle)),
+          if ((annotation.selectedText ?? '').isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.ios_share_rounded),
+              tooltip: l.quoteShareTitle,
+              onPressed: () {
+                Navigator.pop(ctx);
+                _shareHighlight(annotation, onThisPage: true);
+              },
+            ),
+        ]),
+        content: TextField(
+          controller: controller,
+          maxLines: 5,
+          autofocus: true,
+          decoration: InputDecoration(
+            hintText: l.readerNoteHint,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(l.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: Text(l.save),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      await _annotationService.updateNote(
+        itemId: widget.itemId,
+        annotationId: annotation.id,
+        note: result.isEmpty ? null : result,
+      );
+      annotation.note = result.isEmpty ? null : result;
+      if (mounted) setState(() {});
+    }
+  }
+
+  void _navigateToChapter(String href) {
+    _userMoved('chapter');
+    final escaped = href.replaceAll("'", "\\'");
+    _epubController?.webViewController?.evaluateJavascript(
+      source: '''
+        (function() {
+          rendition.display('$escaped').then(function(section) {
+            rendition.resize();
+            // RTL books land on the wrong page after a chapter jump: epub.js resets
+            // the scroll to 0 and only repositions right-to-left content when the
+            // target carries an in-chapter anchor, which a bare chapter href does
+            // not. Re-run epub.js's own RTL placement (scroll the target section's
+            // view to offset+width, which resolves to its first/rightmost page)
+            // against the section we actually navigated to. find(section) is used
+            // rather than the last view because the continuous manager appends the
+            // next chapter during display. Gated to RTL so left-to-right books are
+            // untouched; epub.js's post-display location report picks up the
+            // corrected scroll, so we don't fire our own.
+            try {
+              var mgr = rendition.manager;
+              if (section && mgr && rendition.settings
+                  && rendition.settings.direction === 'rtl'
+                  && mgr.layout && mgr.layout.name !== 'pre-paginated') {
+                var view = mgr.views.find(section);
+                if (view) {
+                  var off = view.offset();
+                  mgr.scrollTo(off.left + view.width(), off.top, true);
+                }
+              }
+            } catch (e) {}
+          });
+        })();
+      ''',
+    );
+  }
+
+  List<EpubChapter> _flattenChapters(List<EpubChapter> chapters) {
+    final flat = <EpubChapter>[];
+    for (final ch in chapters) {
+      flat.add(ch);
+      if (ch.subitems.isNotEmpty) {
+        flat.addAll(_flattenChapters(ch.subitems));
+      }
+    }
+    return flat;
+  }
+
+  void _showChapterList() {
+    final cs = Theme.of(context).colorScheme;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cs.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(AppLocalizations.of(ctx)!.readerChapters, style: Theme.of(ctx).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600, color: cs.onSurface)),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: _chapters.length,
+                itemBuilder: (ctx, i) {
+                  final ch = _chapters[i];
+                  return ListTile(
+                    title: Text(ch.title.trim(), maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: cs.onSurface)),
+                    dense: true,
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _navigateToChapter(ch.href);
+                    },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showSettingsSheet() {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    // Live preview for the side-margin slider so the WebView only re-paginates
+    // when the drag ends, not on every step.
+    int hPreview = _marginH;
+    var paraPreview = _paragraphSpacing;
+    Widget section(String title) => Padding(
+          padding: const EdgeInsets.only(top: 16, bottom: 8),
+          child: Text(title, style: tt.labelLarge?.copyWith(color: cs.primary, fontWeight: FontWeight.w600)),
+        );
+    var sheetRaMode = LyricsService.instance.readAlongMode;
+    var sheetRaColor = LyricsService.instance.readAlongColor;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cs.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final l = AppLocalizations.of(ctx)!;
+          // DraggableScrollableSheet wires the inner scroll to the sheet so a
+          // downward drag past the minimum dismisses it - a bare
+          // SingleChildScrollView swallowed the drag and only the back button
+          // could close the sheet.
+          return SafeArea(
+          child: DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.85,
+            minChildSize: 0.4,
+            maxChildSize: 0.95,
+            builder: (ctx, scrollCtrl) => SingleChildScrollView(
+            controller: scrollCtrl,
+            child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 32, height: 4,
+                    decoration: BoxDecoration(
+                      color: cs.onSurface.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(l.readerSettings, style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 4),
+
+                section(l.readerSectionText),
+                // Font — opens a picker with built-in + downloadable fonts.
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () async {
+                    await _showFontSheet();
+                    setSheetState(() {});
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(children: [
+                      Icon(Icons.font_download_outlined, size: 20, color: cs.onSurfaceVariant),
+                      const SizedBox(width: 12),
+                      Text(l.readerFont, style: tt.bodyMedium),
+                      const Spacer(),
+                      Text(_font.label,
+                          style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                      const SizedBox(width: 4),
+                      Icon(Icons.chevron_right_rounded, size: 20, color: cs.onSurfaceVariant),
+                    ]),
+                  ),
+                ),
+                const SizedBox(height: 4),
+
+                // Font size
+                Row(children: [
+                  Icon(Icons.text_fields_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerFontSize, style: tt.bodyMedium),
+                  const Spacer(),
+                  IconButton(
+                    icon: Icon(Icons.remove_rounded, size: 20, color: cs.onSurfaceVariant),
+                    onPressed: _fontSize > 10 ? () {
+                      setSheetState(() {});
+                      _updateFontSize(_fontSize - 1);
+                    } : null,
+                  ),
+                  Text('$_fontSize', style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                  IconButton(
+                    icon: Icon(Icons.add_rounded, size: 20, color: cs.onSurfaceVariant),
+                    onPressed: _fontSize < 32 ? () {
+                      setSheetState(() {});
+                      _updateFontSize(_fontSize + 1);
+                    } : null,
+                  ),
+                ]),
+                const SizedBox(height: 8),
+
+                // Line height
+                Row(children: [
+                  Icon(Icons.format_line_spacing_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerLineSpacing, style: tt.bodyMedium),
+                  const Spacer(),
+                  Text(_lineHeight.toStringAsFixed(1), style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                ]),
+                Slider(
+                  value: _lineHeight,
+                  min: 1.0,
+                  max: 2.5,
+                  divisions: 15,
+                  onChanged: (v) {
+                    setSheetState(() {});
+                    _updateLineHeight(double.parse(v.toStringAsFixed(1)));
+                  },
+                ),
+                const SizedBox(height: 8),
+
+                // Paragraph spacing; all the way left keeps the book's own.
+                Row(children: [
+                  Icon(Icons.segment_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerParagraphSpacing, style: tt.bodyMedium),
+                  const Spacer(),
+                  Text(paraPreview < 0 ? l.readerParagraphSpacingBook : _emLabel(paraPreview),
+                      style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                ]),
+                Slider(
+                  value: paraPreview < 0 ? -0.25 : paraPreview,
+                  min: -0.25,
+                  max: 2.0,
+                  divisions: 9,
+                  onChanged: (v) => setSheetState(() => paraPreview = v < 0 ? -1 : v),
+                  onChangeEnd: (v) => _updateParagraphSpacing(v < 0 ? -1 : v),
+                ),
+                const SizedBox(height: 8),
+
+                // Text alignment
+                Row(children: [
+                  Icon(Icons.format_align_left_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerTextAlignment, style: tt.bodyMedium),
+                  const Spacer(),
+                  SegmentedButton<bool>(
+                    showSelectedIcon: false,
+                    style: const ButtonStyle(visualDensity: VisualDensity.compact),
+                    segments: [
+                      ButtonSegment(value: false, label: Text(l.readerAlignJustified)),
+                      ButtonSegment(value: true, label: Text(l.readerAlignLeft)),
+                    ],
+                    selected: {_alignLeft},
+                    onSelectionChanged: (sel) {
+                      setSheetState(() {});
+                      _updateAlignLeft(sel.first);
+                    },
+                  ),
+                ]),
+                const SizedBox(height: 8),
+
+                // Theme (background + text colors)
+                Row(children: [
+                  Icon(Icons.palette_outlined, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerTheme, style: tt.bodyMedium),
+                ]),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    for (final p in _kReaderPalettes) ...[
+                      _themeSwatch(
+                        p,
+                        (_themeId.isEmpty ? _resolvePalette(context).id : _themeId) == p.id,
+                        () { setSheetState(() {}); _updateReaderTheme(p.id); },
+                        cs,
+                      ),
+                      const SizedBox(width: 12),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 16),
+
+                section(l.readerSectionPage),
+                // Side margins (left + right)
+                Row(children: [
+                  Icon(Icons.padding_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerSideMargins, style: tt.bodyMedium),
+                  const Spacer(),
+                  Text('${hPreview}px', style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                ]),
+                Slider(
+                  value: hPreview.toDouble(),
+                  min: 0,
+                  max: 64,
+                  divisions: 16,
+                  onChanged: (v) => setSheetState(() => hPreview = v.round()),
+                  onChangeEnd: (v) => _updateMarginH(v.round()),
+                ),
+                const SizedBox(height: 4),
+
+                // Top & bottom margins
+                Row(children: [
+                  Icon(Icons.vertical_align_center_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerTopBottom, style: tt.bodyMedium),
+                  const Spacer(),
+                  Text('${_marginV}px', style: tt.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                ]),
+                Slider(
+                  value: _marginV.toDouble(),
+                  min: 0,
+                  max: 64,
+                  divisions: 16,
+                  onChanged: (v) {
+                    setSheetState(() {});
+                    _updateMarginV(v.round());
+                  },
+                ),
+                const SizedBox(height: 12),
+
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(l.readerScrollMode, style: tt.bodyMedium),
+                  subtitle: Text(l.readerScrollModeHint,
+                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                  value: _scroll,
+                  onChanged: (v) {
+                    setSheetState(() {});
+                    _updateScroll(v);
+                  },
+                ),
+                // Page layout — Auto shows two pages on wide screens (tablets).
+                Row(children: [
+                  Icon(Icons.auto_stories_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerPageLayout, style: tt.bodyMedium),
+                ]),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<int>(
+                    segments: [
+                      ButtonSegment(value: 0, label: Text(l.readerLayoutAuto)),
+                      ButtonSegment(value: 1, label: Text(l.readerLayoutSingle)),
+                      ButtonSegment(value: 2, label: Text(l.readerLayoutTwoPage)),
+                    ],
+                    selected: {_spreadModes.indexOf(_spread)},
+                    showSelectedIcon: false,
+                    // Pages side by side don't apply to a scrolling book.
+                    onSelectionChanged: _scroll
+                        ? null
+                        : (s) {
+                            setSheetState(() {});
+                            _updateSpread(s.first);
+                          },
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(children: [
+                  Icon(Icons.swipe_left_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerPageTurn, style: tt.bodyMedium),
+                ]),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final style in const ['none', 'slide', ...kDrawnTurnStyles])
+                      ChoiceChip(
+                        label: Text(_turnStyleLabel(l, style)),
+                        selected: _turnStyle == style,
+                        showCheckmark: false,
+                        // A scrolling book has no pages to turn.
+                        onSelected: _scroll
+                            ? null
+                            : (_) {
+                                setSheetState(() {});
+                                _updateTurnStyle(style);
+                              },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  // A scrolling book shows the controls on any tap.
+                  onTap: _scroll
+                      ? null
+                      : () {
+                          Navigator.pop(ctx);
+                          _editTapZones();
+                        },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(children: [
+                      Icon(Icons.touch_app_outlined, size: 20, color: cs.onSurfaceVariant),
+                      const SizedBox(width: 12),
+                      Text(l.readerTapZones,
+                          style: tt.bodyMedium?.copyWith(
+                              color: _scroll ? cs.onSurface.withValues(alpha: 0.38) : null)),
+                      const Spacer(),
+                      Icon(Icons.chevron_right_rounded, size: 20, color: cs.onSurfaceVariant),
+                    ]),
+                  ),
+                ),
+
+                section(l.readerSectionTopBar),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(l.readerPinTopBar, style: tt.bodyMedium),
+                  subtitle: Text(l.readerPinTopBarHint,
+                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                  value: _pinTop,
+                  onChanged: (v) {
+                    setSheetState(() {});
+                    _updatePinTop(v);
+                  },
+                ),
+                Row(children: [
+                  Icon(Icons.linear_scale_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerTopBarProgress, style: tt.bodyMedium),
+                ]),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<String>(
+                    segments: [
+                      ButtonSegment(value: 'book', label: Text(l.readerTopBarProgressBook)),
+                      ButtonSegment(value: 'chapter', label: Text(l.readerTopBarProgressChapter)),
+                      ButtonSegment(value: 'both', label: Text(l.readerTopBarProgressBoth)),
+                    ],
+                    selected: {_topBarProgress},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (s) {
+                      setSheetState(() {});
+                      _updateTopBarProgress(s.first);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(l.readerKeepAwake, style: tt.bodyMedium),
+                  subtitle: Text(l.readerKeepAwakeHint,
+                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                  value: _keepAwake,
+                  onChanged: (v) {
+                    setSheetState(() {});
+                    _updateKeepAwake(v);
+                  },
+                ),
+                const SizedBox(height: 8),
+
+                const SizedBox(height: 8),
+                Row(children: [
+                  Icon(Icons.timer_outlined, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Text(l.readerHideControls, style: tt.bodyMedium),
+                ]),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<int>(
+                    segments: [
+                      ButtonSegment(value: 0, label: Text(l.readerHideControlsNever)),
+                      for (final secs in const [3, 5, 10])
+                        ButtonSegment(value: secs, label: Text(l.readerHideControlsAfter(secs))),
+                    ],
+                    selected: {_controlsHideAfter},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (sel) {
+                      setSheetState(() {});
+                      _updateControlsHideAfter(sel.first);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+
+                section(l.readerSectionControls),
+
+                // Volume keys turn pages (normal: up = previous, down = next)
+                Row(children: [
+                  Icon(Icons.swap_vert_rounded, size: 20, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 12),
+                  Expanded(child: Text(l.readerVolumeNav, style: tt.bodyMedium)),
+                ]),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<String>(
+                    showSelectedIcon: false,
+                    segments: [
+                      ButtonSegment(value: 'off', label: Text(l.readerVolumeNavOff)),
+                      ButtonSegment(value: 'normal', label: Text(l.readerVolumeNavNormal)),
+                      ButtonSegment(value: 'mirrored', label: Text(l.readerVolumeNavMirrored)),
+                    ],
+                    selected: {_volumeNavMode},
+                    onSelectionChanged: (sel) {
+                      final v = sel.first;
+                      setSheetState(() {});
+                      setState(() => _volumeNavMode = v);
+                      PlayerSettings.setEreaderVolumeNav(v);
+                    },
+                    style: const ButtonStyle(visualDensity: VisualDensity.compact),
+                  ),
+                ),
+                if (_volumeNavMode != 'off')
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(l.readerVolumeNavWhilePlaying, style: tt.bodyMedium),
+                    value: _volumeNavWhilePlaying,
+                    onChanged: (v) {
+                      setSheetState(() {});
+                      setState(() => _volumeNavWhilePlaying = v);
+                      PlayerSettings.setEreaderVolumeNavWhilePlaying(v);
+                    },
+                  ),
+
+                // Read along, mirrored from the transcription settings so the
+                // reader can change them without leaving the book.
+                if (_transcriptionOn || _useNarration) ...[
+                  section(l.readAlong),
+                  // E-ink always follows by sentence, and an EPUB's own
+                  // narration is timed by the sentence, so the choice is hidden.
+                  if (!PlayerSettings.einkMode && !_useNarration) ...[
+                    SizedBox(
+                      width: double.infinity,
+                      child: SegmentedButton<String>(
+                        segments: [
+                          ButtonSegment(value: 'word', label: Text(l.readAlongFollowWord)),
+                          ButtonSegment(value: 'sentence', label: Text(l.readAlongFollowSentence)),
+                        ],
+                        selected: {sheetRaMode},
+                        showSelectedIcon: false,
+                        onSelectionChanged: (sel) async {
+                          setSheetState(() => sheetRaMode = sel.first);
+                          await PlayerSettings.setReadAlongMode(sel.first);
+                          await LyricsService.instance.reloadDisplayPrefs();
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  Wrap(spacing: 10, runSpacing: 10, children: [
+                    for (final c in PlayerSettings.readAlongPalette)
+                      GestureDetector(
+                        onTap: () async {
+                          setSheetState(() => sheetRaColor = c);
+                          await PlayerSettings.setReadAlongColor(c);
+                          await LyricsService.instance.reloadDisplayPrefs();
+                        },
+                        child: Container(
+                          width: 32,
+                          height: 32,
+                          decoration: BoxDecoration(
+                            color: Color(c),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: sheetRaColor == c ? cs.onSurface : Colors.transparent,
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ]),
+                  const SizedBox(height: 16),
+                ],
+
+                section(l.readerSectionStats),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(l.readerLogReading, style: tt.bodyMedium),
+                  subtitle: Text(l.readerLogReadingHint,
+                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                  value: _logReading,
+                  onChanged: (v) {
+                    _setLogReading(v);
+                    setSheetState(() {});
+                  },
+                ),
+
+              ],
+            ),
+          ),
+          ),
+          ),
+        );
+        },
+      ),
+    ).whenComplete(_refreshCurlShot);
+  }
+
+  static const double _autoScrollMin = 6;
+  static const double _autoScrollMax = 220;
+
+  int get _autoScrollPercent =>
+      (((_autoScrollSpeed - _autoScrollMin) / (_autoScrollMax - _autoScrollMin)) * 100)
+          .round()
+          .clamp(1, 100);
+
+  void _setupAutoScrollHandlers() {
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollSpeed',
+      callback: (args) {
+        final v = args.isNotEmpty ? (args[0] as num?)?.toDouble() : null;
+        if (v == null || !mounted) return;
+        setState(() => _autoScrollSpeed = v);
+        final l = AppLocalizations.of(context)!;
+        _speedToast ??= LiveOverlayToast.show(
+          context,
+          l.readerAutoScrollSpeed(_autoScrollPercent),
+          icon: Icons.speed_rounded,
+        );
+        _speedToast?.update(
+          l.readerAutoScrollSpeed(_autoScrollPercent),
+          icon: Icons.speed_rounded,
+        );
+      },
+    );
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollLog',
+      callback: (args) {
+        if (args.isNotEmpty) debugPrint('[AutoScroll] ${args[0]}');
+      },
+    );
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollDragEnd',
+      callback: (args) {
+        _speedToast?.dismiss();
+        _speedToast = null;
+        PlayerSettings.setEreaderAutoScrollSpeed(_autoScrollSpeed);
+      },
+    );
+    // The blind stopping on its own: the last page of the book, or a page
+    // that failed to load.
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollEnded',
+      callback: (args) {
+        if (!mounted || !_autoScroll) return;
+        final atEnd = args.isNotEmpty && args[0]?.toString() == 'end';
+        _speedToast?.dismiss();
+        _speedToast = null;
+        setState(() {
+          _autoScroll = false;
+          _autoScrollPaused = false;
+        });
+        _cancelAutoScrollSleep();
+        _syncScreenWake();
+        final l = AppLocalizations.of(context)!;
+        showOverlayToast(
+          context,
+          atEnd ? l.readerAutoScrollEndOfBook : l.readerAutoScrollStopped,
+          icon: atEnd ? Icons.menu_book_rounded : Icons.stop_circle_outlined,
+        );
+      },
+    );
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollLongPress',
+      callback: (args) {
+        if (!mounted || !_autoScroll) return;
+        _speedToast?.dismiss();
+        _speedToast = null;
+        _toggleAutoScroll();
+        showOverlayToast(context, AppLocalizations.of(context)!.readerAutoScrollStopped,
+            icon: Icons.stop_circle_outlined);
+      },
+    );
+    _epubController?.webViewController?.addJavaScriptHandler(
+      handlerName: 'absorbAutoScrollTap',
+      callback: (args) {
+        if (!mounted || !_autoScroll) return;
+        // With the reader's bars up, a tap dismisses those - otherwise there is
+        // no way to clear them without also interrupting the scroll.
+        if (_showControls) {
+          _toggleControls();
+          _epubController?.autoScrollPause(_autoScrollPaused);
+          return;
+        }
+        setState(() => _autoScrollPaused = !_autoScrollPaused);
+        _epubController?.autoScrollPause(_autoScrollPaused);
+        final l = AppLocalizations.of(context)!;
+        showOverlayToast(
+          context,
+          _autoScrollPaused ? l.readerAutoScrollPaused : l.readerAutoScrollResumed,
+          icon: _autoScrollPaused ? Icons.pause_rounded : Icons.play_arrow_rounded,
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleAutoScroll() async {
+    if (_autoScroll) {
+      await _epubController?.autoScrollStop();
+      _cancelAutoScrollSleep();
+      if (!mounted) return;
+      setState(() {
+        _autoScroll = false;
+        _autoScrollPaused = false;
+      });
+      _syncScreenWake();
+      return;
+    }
+    // Read along and the blind both move the page; only one runs at a time.
+    if (_readAlongOn) _stopReadAlong();
+    // The blind can't start before the book is displayed. Flagging auto
+    // scroll on regardless left the reader with its taps swallowed and no
+    // bars to reach this button again.
+    final started =
+        await _epubController?.autoScrollStart(speed: _autoScrollSpeed) ?? false;
+    if (!mounted || !started) return;
+    _screenWakeHeldOff = false;
+    ScreenWake.hold('reader', true);
+    showOverlayToast(context, AppLocalizations.of(context)!.readerAutoScrollStarted,
+        icon: Icons.swap_vert_rounded);
+    setState(() {
+      _autoScroll = true;
+      _autoScrollPaused = false;
+      if (_showControls) _showControls = false;
+    });
+  }
+
+  Widget _themeSwatch(_ReaderPalette p, bool selected, VoidCallback onTap, ColorScheme cs) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: p.bgColor,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: selected ? cs.primary : cs.onSurface.withValues(alpha: 0.25),
+            width: selected ? 3 : 1,
+          ),
+        ),
+        child: Center(
+          child: Text('Aa',
+              style: TextStyle(color: p.fgColor, fontSize: 13, fontWeight: FontWeight.w600)),
+        ),
+      ),
+    );
+  }
+
+  /// Font picker: built-in fonts plus downloadable ones (downloaded once, then
+  /// rendered via injected @font-face). Live download state via the service.
+  Future<void> _showFontSheet() async {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final svc = ReaderFontService();
+    await svc.load();
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: cs.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: ListenableBuilder(
+          listenable: svc,
+          builder: (ctx, _) {
+            Widget tile(ReaderFont f) {
+              final selected = f.id == _fontId;
+              final installed = !f.downloadable || svc.isInstalled(f.id);
+              final downloading = svc.isDownloading(f.id);
+              return ListTile(
+                dense: true,
+                leading: Icon(
+                  selected
+                      ? Icons.radio_button_checked_rounded
+                      : Icons.radio_button_unchecked_rounded,
+                  color: selected ? cs.primary : cs.onSurfaceVariant,
+                ),
+                title: Text(f.label,
+                    style: TextStyle(
+                        color: cs.onSurface,
+                        fontWeight: selected ? FontWeight.w700 : FontWeight.w400)),
+                trailing: downloading
+                    ? const SizedBox(
+                        width: 20, height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : (f.downloadable
+                        ? (installed
+                            ? IconButton(
+                                icon: Icon(Icons.delete_outline_rounded,
+                                    color: cs.onSurfaceVariant),
+                                tooltip: AppLocalizations.of(context)!.readerFontRemove,
+                                onPressed: () => svc.remove(f.id),
+                              )
+                            : Icon(Icons.download_rounded, color: cs.primary))
+                        : null),
+                onTap: () async {
+                  if (installed) {
+                    _updateReaderFont(f.id);
+                    if (mounted) Navigator.of(ctx).pop();
+                    return;
+                  }
+                  final ok = await svc.download(f);
+                  if (ok) {
+                    _updateReaderFont(f.id);
+                    if (mounted) Navigator.of(ctx).pop();
+                  } else if (mounted) {
+                    showOverlayToast(context, AppLocalizations.of(context)!.readerFontDownloadFailed(f.label),
+                        icon: Icons.error_outline_rounded);
+                  }
+                },
+              );
+            }
+
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 8),
+                Center(
+                  child: Container(
+                    width: 40, height: 4,
+                    decoration: BoxDecoration(
+                      color: cs.onSurface.withValues(alpha: 0.24),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(AppLocalizations.of(ctx)!.readerFont,
+                        style: tt.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w600, color: cs.onSurface)),
+                  ),
+                ),
+                Flexible(
+                  child: ListView(
+                    shrinkWrap: true,
+                    children: [
+                      for (final f in kBuiltinReaderFonts) tile(f),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                        child: Text(AppLocalizations.of(ctx)!.readerMoreFonts,
+                            style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                      ),
+                      for (final f in kDownloadableReaderFonts) tile(f),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Maps a spine item href to its TOC chapter title. The spine href and the
+  /// TOC href often differ by directory prefix or URL-encoding (e.g.
+  /// `OEBPS/Text/ch1.xhtml` vs `Text/ch1.xhtml` vs `ch1%20.xhtml`), so match on
+  /// the decoded basename first and fall back to a suffix check. Chapters
+  /// pointing at sub-fragments of the same spine item all map to the same
+  /// label, which is fine for a search result subtitle.
+  String? _chapterForHref(String href) {
+    if (href.isEmpty || _chapters.isEmpty) return null;
+    String basename(String s) {
+      var p = s.split('#').first;
+      try { p = Uri.decodeFull(p); } catch (_) {}
+      return p.split('/').last.toLowerCase();
+    }
+    // TOC labels often carry the nav markup's indentation/newlines, so trim.
+    String? label(String t) => t.trim().isEmpty ? null : t.trim();
+    final base = basename(href);
+    if (base.isNotEmpty) {
+      for (final ch in _chapters) {
+        if (basename(ch.href) == base) return label(ch.title);
+      }
+    }
+    // Fallback: suffix match on the full path.
+    final path = href.split('#').first;
+    for (final ch in _chapters) {
+      final tocPath = ch.href.split('#').first;
+      if (tocPath.isEmpty) continue;
+      if (path.endsWith(tocPath) || tocPath.endsWith(path)) return label(ch.title);
+    }
+    return null;
+  }
+
+  /// Searches the whole book. Bypasses the plugin's search(): that one runs
+  /// Promise.all over the spine with no error handling, so a single chapter
+  /// that fails to load means the result handler never fires and the await
+  /// hangs forever. This version searches chapter by chapter, skips broken
+  /// ones, and tags each hit with the spine href so we can label it with a
+  /// chapter title.
+  Future<_SearchPayload> _searchBook(String q) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return _SearchPayload(query: q, results: const [], chapters: const []);
+    final res = await wc.callAsyncJavaScript(
+      functionBody: '''
+        // Search a SEPARATE epub.js Book that shares the live book's packaging
+        // and loader but owns its own spine sections. The old version loaded and
+        // unloaded every section of the LIVE book, tearing state out from under
+        // the rendition and wedging its shared next/prev/display queue — which
+        // froze page turns after a search-jump. Result CFIs are identical because
+        // cfiBase is derived from the same packaging. Cached per webview (one
+        // book per reader), so re-searches reuse it.
+        var sb = window.__absorbSearchBook;
+        if (!sb) {
+          sb = ePub();
+          sb.spine.unpack(book.packaging, book.resolve.bind(book), book.canonical.bind(book));
+          window.__absorbSearchBook = sb;
+        }
+        var out = [];
+        var items = (sb.spine && sb.spine.spineItems) ? sb.spine.spineItems : [];
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          try {
+            await item.load(book.load.bind(book));
+            var found = (typeof item.search === 'function') ? item.search(query) : item.find(query);
+            found = found || [];
+            for (var j = 0; j < found.length; j++) {
+              // occ = which occurrence of the query this is WITHIN its section
+              // (0-based, document order). Used at jump time to re-find the exact
+              // same hit in the live rendered DOM.
+              out.push({ cfi: found[j].cfi, excerpt: found[j].excerpt || '', href: item.href || '', occ: j });
+            }
+          } catch (e) {
+          } finally {
+            try { item.unload(); } catch (e2) {}
+          }
+        }
+        return JSON.stringify(out);
+      ''',
+      arguments: {'query': q},
+    ).timeout(const Duration(seconds: 60), onTimeout: () => null);
+    final raw = res?.value;
+    if (raw is! String || raw.isEmpty) {
+      return _SearchPayload(query: q, results: const [], chapters: const []);
+    }
+    List<dynamic> list;
+    try {
+      list = jsonDecode(raw) as List<dynamic>;
+    } catch (_) {
+      return _SearchPayload(query: q, results: const [], chapters: const []);
+    }
+    final results = <EpubSearchResult>[];
+    final chapters = <String?>[];
+    _resultOccByCfi.clear();
+    for (final entry in list) {
+      final m = entry as Map<String, dynamic>;
+      final cfi = m['cfi'] as String? ?? '';
+      if (cfi.isEmpty) continue;
+      results.add(EpubSearchResult(cfi: cfi, excerpt: (m['excerpt'] as String? ?? '').trim()));
+      chapters.add(_chapterForHref(m['href'] as String? ?? ''));
+      _resultOccByCfi[cfi] = (m['occ'] as num?)?.toInt() ?? 0;
+    }
+    return _SearchPayload(query: q, results: results, chapters: chapters);
+  }
+
+  void _jumpToSearchResult(EpubSearchResult result) {
+    _rememberSpot(EbookSpotReason.beforeJump);
+    _holdOpenSpot = false;
+    final wc = _epubController?.webViewController;
+    final query = _lastSearchedQuery;
+    final occ = _resultOccByCfi[result.cfi] ?? 0;
+    debugPrint('[Search] jump query="$query" occ=$occ cfi=${result.cfi}');
+    if (wc == null || query.isEmpty) {
+      _jumpToRawCfi(result.cfi);
+      return;
+    }
+    // The search-result CFI was generated against the section parsed as XML
+    // (book.load), but the reader renders the chapter as HTML in an iframe. The
+    // two DOM trees differ structurally, so that CFI can resolve to the wrong
+    // spot. Navigate to the section with the rough CFI, then re-find the exact
+    // hit in the LIVE rendered document and rebuild the CFI there. Uses the
+    // section's whole concatenated text (so a match split across formatting
+    // spans still resolves) and the occurrence index (so a repeated word lands
+    // on the one the user tapped, not the first).
+    wc.callAsyncJavaScript(
+      functionBody: '''
+        var dbg = { matched: false };
+        try {
+          await rendition.display(cfi);
+          var target = null;
+          try { target = book.spine.get(cfi); } catch (e) {}
+          var si = target ? target.index : -1;
+          dbg.si = si;
+          var contents = (typeof rendition.getContents === 'function') ? rendition.getContents() : [];
+          dbg.nContents = contents.length;
+          dbg.secIdx = contents.map(function(x){ return x.sectionIndex; });
+          var c = null;
+          for (var i = 0; i < contents.length; i++) {
+            if (si < 0 || contents[i].sectionIndex === si) { c = contents[i]; break; }
+          }
+          if (!c) c = contents[0];
+          var doc = c && c.document;
+          if (doc) {
+            var tw = doc.createTreeWalker(doc.body || doc, NodeFilter.SHOW_TEXT, null, false);
+            var nodes = [], text = '', node;
+            while (node = tw.nextNode()) {
+              nodes.push({ node: node, start: text.length, len: node.textContent.length });
+              text += node.textContent;
+            }
+            dbg.textLen = text.length;
+            var hay = text.toLowerCase();
+            var needle = (query || '').toLowerCase();
+            dbg.total = 0;
+            { var t = hay.indexOf(needle); while (needle && t !== -1) { dbg.total++; t = hay.indexOf(needle, t + 1); } }
+            if (needle && nodes.length) {
+              var pos = hay.indexOf(needle);
+              for (var n = 0; n < (occ || 0) && pos !== -1; n++) {
+                var np = hay.indexOf(needle, pos + 1);
+                if (np === -1) break;
+                pos = np;
+              }
+              dbg.pos = pos;
+              if (pos !== -1) {
+                var locate = function (off) {
+                  for (var k = 0; k < nodes.length; k++) {
+                    var e = nodes[k];
+                    if (off < e.start + e.len) return { node: e.node, offset: off - e.start };
+                  }
+                  var last = nodes[nodes.length - 1];
+                  return { node: last.node, offset: last.len };
+                };
+                var s = locate(pos), en = locate(pos + needle.length);
+                var r = doc.createRange();
+                r.setStart(s.node, s.offset);
+                r.setEnd(en.node, en.offset);
+                var liveCfi = c.cfiFromRange(r);
+                if (liveCfi) { dbg.matched = true; dbg.liveCfi = liveCfi; await rendition.display(liveCfi); }
+              }
+            }
+          }
+        } catch (e) { dbg.err = String(e); }
+        return JSON.stringify(dbg);
+      ''',
+      arguments: {'cfi': result.cfi, 'query': query, 'occ': occ},
+    ).then((res) {
+      if (!mounted) return;
+      final raw = res?.value;
+      debugPrint('[Search] anchor $raw');
+      var liveCfi = result.cfi;
+      if (raw is String) {
+        try {
+          final d = jsonDecode(raw) as Map<String, dynamic>;
+          if (d['matched'] == true && d['liveCfi'] is String) {
+            liveCfi = d['liveCfi'] as String;
+          }
+        } catch (_) {}
+      }
+      _highlightSearchHit(liveCfi);
+    });
+  }
+
+  void _jumpToRawCfi(String cfi) {
+    _epubController?.display(cfi: cfi);
+    _highlightSearchHit(cfi);
+  }
+
+  // Find in ebook: how sure the fuzzy match must be before the reader jumps.
+  // fine = 1 - levenshtein/maxLen over normalized text (1.0 = identical). A
+  // correct Whisper transcript of clean narration lands around 0.75-0.95; the
+  // hint bonus lets a borderline hit through only when it sits in the chapter
+  // the audio says it should. Tuned against device logs - see [FindEbook] lines.
+  static const double _findFineFloor = 0.55;
+  static const double _findAcceptScore = 0.68;
+  static const double _findHintBonus = 0.06;
+  static const double _findMargin = 0.05;
+  // Retry window when the first transcript is too short or generic to stand
+  // out (5s of plain dialogue can tie with passages all over the book).
+  static const double _findRetryWindowSeconds = 15.0;
+
+  /// Runs the whole Find in ebook flow: fuzzy-locate the transcript, decide
+  /// whether the best hit is trustworthy, then jump + flash or toast and stay.
+  Future<void> _runFindInEbook(String transcript, String? chapterHint,
+      {double? positionSeconds}) async {
+    final l = AppLocalizations.of(context)!;
+    if (_finding) return;
+    _holdOpenSpot = false;
+    setState(() => _finding = true);
+    showProgressDialog(context, l.findInEbookSearching);
+
+    Map<String, dynamic>? decision;
+    final pos = positionSeconds ?? widget.findPositionSeconds;
+    var windowSeconds = findInEbookWindowSeconds;
+    try {
+      decision = await _decideFindTarget(transcript, chapterHint,
+          nearSeconds: pos);
+      // A short transcript can be too generic to stand out ("So what I am.
+      // Am I?" ties with dialogue all over the book). Before giving up,
+      // listen to a longer window ending at the same spot and try once more.
+      if (decision == null && pos != null) {
+        windowSeconds = _findRetryWindowSeconds;
+        debugPrint('[FindEbook] not confident on the short window - '
+            'retrying with ${_findRetryWindowSeconds.toStringAsFixed(0)}s');
+        try {
+          final longer = await TranscriptionService.instance.transcribeAt(
+            itemId: widget.itemId,
+            positionSeconds: pos,
+            windowSeconds: _findRetryWindowSeconds,
+            leadSeconds: _findRetryWindowSeconds,
+            preferAccuracy: false,
+            feature: TranscriptionFeature.readAlong,
+          );
+          try {
+            final f = File(longer.audioPath);
+            if (f.existsSync()) await f.delete();
+          } catch (_) {}
+          decision = await _decideFindTarget(longer.text.trim(), chapterHint,
+              nearSeconds: pos);
+        } on TranscriptionException catch (e) {
+          debugPrint('[FindEbook] retry transcription failed: $e');
+        }
+      }
+    } catch (e) {
+      debugPrint('[FindEbook] failed: $e');
+    }
+
+    if (!mounted) return;
+    Navigator.pop(context); // progress dialog
+    setState(() => _finding = false);
+
+    if (decision == null) {
+      showOverlayToast(context, l.findInEbookNotFound,
+          icon: Icons.search_off_rounded);
+      return;
+    }
+    final jumped = await _jumpToFindHit(
+        decision['href'] as String, decision['excerpt'] as String);
+    if (!mounted) return;
+    if (!jumped) {
+      showOverlayToast(context, l.findInEbookNotFound,
+          icon: Icons.search_off_rounded);
+      return;
+    }
+    // The transcript window ended at the pause point, so its last words are
+    // where the audio was.
+    if (pos != null && decision['e'] is num) {
+      unawaited(_rememberEbookHit(
+          decision, pos, (decision['e'] as num).toDouble(), windowSeconds));
+    }
+  }
+
+  /// Fuzzy-search the book for the transcript and apply the confidence rules.
+  /// Returns {href, excerpt} for a trustworthy hit, null when not confident.
+  Future<Map<String, dynamic>?> _decideFindTarget(
+      String transcript, String? chapterHint,
+      {double? nearSeconds}) async {
+    // Whisper sometimes emits bracketed non-speech tags; they'd poison matching.
+    final cleaned = transcript
+        .replaceAll(RegExp(r'\[[^\]]*\]|\([^)]*\)'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (cleaned.split(' ').length < 3) {
+      debugPrint('[FindEbook] transcript too short after cleaning: "$cleaned"');
+      return null;
+    }
+
+    // Spine sections whose TOC chapter agrees with the audio chapter get
+    // searched first (and an early exit on a strong hit there).
+    // Sections that earlier finds or read along pinned near this time come
+    // before the chapter-title guess: they are known, the title is inferred.
+    final hintBases = <String>[];
+    if (nearSeconds != null) hintBases.addAll(await _syncHintBases(nearSeconds));
+    if (chapterHint != null) {
+      for (final ch in _chapters) {
+        if (chapterTitlesAgree(chapterHint, ch.title)) {
+          final base = ch.href.split('#').first.split('/').last.toLowerCase();
+          if (base.isNotEmpty && !hintBases.contains(base)) hintBases.add(base);
+        }
+      }
+    }
+    debugPrint('[FindEbook] query="$cleaned" hintBases=$hintBases');
+
+    final raw = await _fuzzyFindPassage(cleaned, hintBases);
+    if (raw == null) return null;
+    final best = raw['best'] as Map<String, dynamic>?;
+    final second = raw['second'] as Map<String, dynamic>?;
+    if (best == null) {
+      debugPrint('[FindEbook] no candidates');
+      return null;
+    }
+
+    double scoreOf(Map<String, dynamic> c) {
+      final fine = (c['fine'] as num?)?.toDouble() ?? 0;
+      final agrees = chapterHint != null &&
+          chapterTitlesAgree(chapterHint, _chapterForHref(c['href'] as String? ?? '') ?? '');
+      return fine + (agrees ? _findHintBonus : 0);
+    }
+
+    final bestFine = (best['fine'] as num?)?.toDouble() ?? 0;
+    final bestScore = scoreOf(best);
+    double? secondScore;
+    var sameSpot = false;
+    if (second != null) {
+      secondScore = scoreOf(second);
+      final bestStart = (best['s'] as num?)?.toDouble() ?? 0;
+      final secondStart = (second['s'] as num?)?.toDouble() ?? 0;
+      sameSpot =
+          second['idx'] == best['idx'] && (secondStart - bestStart).abs() < 200;
+    }
+    final margin = secondScore == null || sameSpot || bestScore - secondScore >= _findMargin;
+    final confident =
+        bestFine >= _findFineFloor && bestScore >= _findAcceptScore && margin;
+    debugPrint('[FindEbook] best fine=${bestFine.toStringAsFixed(3)} '
+        'score=${bestScore.toStringAsFixed(3)} href=${best['href']} '
+        'chapter=${_chapterForHref(best['href'] as String? ?? '')} '
+        'second=${secondScore?.toStringAsFixed(3)} sameSpot=$sameSpot '
+        'confident=$confident excerpt="${best['excerpt']}"');
+    if (!confident) return null;
+    return {
+      'href': best['href'] as String? ?? '',
+      'excerpt': best['excerpt'] as String? ?? '',
+      'idx': best['idx'],
+      's': best['s'],
+      'e': best['e'],
+    };
+  }
+
+  /// Spine sections holding sync points recorded within ten minutes of
+  /// [seconds], nearest first - the sections a transcript from around that
+  /// time almost certainly lives in.
+  Future<List<String>> _syncHintBases(double seconds) async {
+    final pts = await SyncPointStore.instance.load(widget.itemId);
+    if (pts.isEmpty) return const [];
+    final near = pts.where((p) => (p.t - seconds).abs() <= 600).toList()
+      ..sort((a, b) => (a.t - seconds).abs().compareTo((b.t - seconds).abs()));
+    if (near.isEmpty) return const [];
+    final hrefs = await _spineHrefs();
+    final out = <String>[];
+    for (final p in near) {
+      if (p.si < 0 || p.si >= hrefs.length) continue;
+      final base = hrefs[p.si].split('#').first.split('/').last.toLowerCase();
+      if (base.isNotEmpty && !out.contains(base)) out.add(base);
+      if (out.length >= 3) break;
+    }
+    return out;
+  }
+
+  /// A confirmed hit from a transcript taken at [seconds] becomes a sync
+  /// point at [off] characters into section [idx]; [err] is how far the
+  /// transcript window could put the words from [seconds].
+  Future<void> _rememberEbookHit(
+      Map<String, dynamic> decision, double seconds, double off, double err) async {
+    final idx = decision['idx'];
+    if (idx is! num || seconds < 0) return;
+    final hrefs = await _spineHrefs();
+    await SyncPointStore.instance.add(
+      widget.itemId,
+      SyncPoint(t: seconds, si: idx.toInt(), off: off, src: 'e', err: err),
+      spineLength: hrefs.isEmpty ? null : hrefs.length,
+    );
+  }
+
+  /// Fuzzy passage search over the separate search Book (same instance the
+  /// exact search uses - never the live book, that wedges page turns). Token
+  /// bag-of-words narrows candidate windows cheaply, then character-level
+  /// Levenshtein on the normalized window ranks them. Returns the two best
+  /// candidates across the book, hinted sections first with early exit.
+  Future<Map<String, dynamic>?> _fuzzyFindPassage(
+      String transcript, List<String> hintBases) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return null;
+    final res = await wc.callAsyncJavaScript(
+      functionBody: r'''
+        var sb = window.__absorbSearchBook;
+        if (!sb) {
+          sb = ePub();
+          sb.spine.unpack(book.packaging, book.resolve.bind(book), book.canonical.bind(book));
+          window.__absorbSearchBook = sb;
+        }
+        function toks(s){ return (s.toLowerCase().match(/[\p{L}\p{N}']+/gu) || []); }
+        function base(h){ return (h||'').split('#')[0].split('/').pop().toLowerCase(); }
+        function lev(a,b){
+          var m=a.length,n=b.length; if(!m)return n; if(!n)return m;
+          var prev=new Array(n+1), cur=new Array(n+1), i, j, tmp;
+          for(j=0;j<=n;j++)prev[j]=j;
+          for(i=1;i<=m;i++){ cur[0]=i; var ca=a.charCodeAt(i-1);
+            for(j=1;j<=n;j++){ var cost=(ca===b.charCodeAt(j-1))?0:1;
+              cur[j]=Math.min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost); }
+            tmp=prev; prev=cur; cur=tmp; }
+          return prev[n];
+        }
+        var T = toks(transcript);
+        if (T.length < 3) return JSON.stringify({err:'short'});
+        var need = {}; T.forEach(function(t){ need[t]=(need[t]||0)+1; });
+        var tNorm = T.join(' ');
+        var W = T.length;
+        var items = (sb.spine && sb.spine.spineItems) ? sb.spine.spineItems : [];
+        var order = [], i;
+        for (i=0;i<items.length;i++){ if (hints.indexOf(base(items[i].href))!==-1) order.push(i); }
+        for (i=0;i<items.length;i++){ if (order.indexOf(i)===-1) order.push(i); }
+        var best=null, second=null;
+        function offer(c){
+          if (!best || c.fine > best.fine){ second = best; best = c; }
+          else if (!second || c.fine > second.fine){ second = c; }
+        }
+        for (var oi=0; oi<order.length; oi++){
+          var idx=order[oi], item=items[idx], text='';
+          try {
+            await item.load(book.load.bind(book));
+            var d=item.document;
+            text = d ? ((d.body && d.body.textContent) || (d.documentElement && d.documentElement.textContent) || '') : '';
+          } catch(e){ text=''; }
+          finally { try { item.unload(); } catch(e2){} }
+          if (!text) continue;
+          var st=[], re=/[\p{L}\p{N}']+/gu, mm;
+          while((mm=re.exec(text))!==null){ st.push({t:mm[0].toLowerCase(), s:mm.index, e:mm.index+mm[0].length}); }
+          if (st.length < 3) continue;
+          var have={}, matched=0, cands=[], p;
+          for (p=0;p<st.length;p++){
+            var tk=st[p].t; have[tk]=(have[tk]||0)+1; if (have[tk] <= (need[tk]||0)) matched++;
+            if (p>=W){ var old=st[p-W].t; if (have[old] <= (need[old]||0)) matched--; have[old]--; }
+            if (matched >= Math.max(2, Math.floor(W*0.4))) cands.push({i:Math.max(0,p-W+1), m:matched});
+          }
+          cands.sort(function(a,b){ return b.m-a.m; });
+          var used=[], picked=[];
+          for (var c=0;c<cands.length && picked.length<4;c++){
+            var s0=cands[c].i, ok=true;
+            for (var u=0;u<used.length;u++){ if (Math.abs(used[u]-s0) < W) { ok=false; break; } }
+            if (ok){ picked.push(cands[c]); used.push(s0); }
+          }
+          for (var pc=0;pc<picked.length;pc++){
+            var s1=picked[pc].i, e1=Math.min(st.length-1, s1+W-1);
+            var winNorm = st.slice(s1,e1+1).map(function(x){return x.t;}).join(' ');
+            var dl = lev(tNorm, winNorm);
+            var fine = 1 - dl/Math.max(tNorm.length, winNorm.length);
+            offer({ href:item.href||'', idx:idx, s:st[s1].s, e:st[e1].e,
+                    fine:fine, coarse:picked[pc].m/W,
+                    excerpt:text.substring(st[s1].s, st[e1].e) });
+          }
+          // A strong hit inside a hinted section is trustworthy enough to stop.
+          if (best && best.fine >= 0.85 && hints.indexOf(base(item.href))!==-1) break;
+        }
+        return JSON.stringify({best:best, second:second, tokens:W});
+      ''',
+      arguments: {'transcript': transcript, 'hints': hintBases},
+    ).timeout(const Duration(seconds: 90), onTimeout: () => null);
+    final raw = res?.value;
+    if (raw is! String || raw.isEmpty) return null;
+    try {
+      return jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Displays the hit's section, re-finds the matched excerpt in the LIVE
+  /// rendered DOM (whitespace-normalized - the search doc is parsed as XML and
+  /// whitespace differs), rebuilds the range there and lands on its CFI with
+  /// the search flash. Restores the previous position when the re-find fails,
+  /// so a bad anchor never strands the user at a chapter start.
+  Future<bool> _jumpToFindHit(String href, String excerpt,
+      {bool flash = true}) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null || href.isEmpty || excerpt.trim().isEmpty) return false;
+    if (!_readAlongOn) _rememberSpot(EbookSpotReason.beforeJump);
+    // A hit that runs across several paragraphs gives epub.js a range it
+    // displays ten pages short of (seen with a 12s read along window). The
+    // first paragraph on its own lands on the right page.
+    var anchor = excerpt;
+    for (final part in excerpt.split('\n')) {
+      final t = part.trim();
+      if (t.split(RegExp(r'\s+')).length >= 4) {
+        anchor = t;
+        break;
+      }
+    }
+    if (anchor != excerpt) {
+      debugPrint('[FindEbook] anchoring on the first paragraph of the hit: '
+          '"${anchor.length > 60 ? anchor.substring(0, 60) : anchor}..."');
+      excerpt = anchor;
+    }
+    final res = await wc.callAsyncJavaScript(
+      functionBody: r'''
+        var dbg = { matched: false };
+        var backCfi = null;
+        try {
+          try { var loc = rendition.currentLocation(); backCfi = loc && loc.start ? loc.start.cfi : null; } catch(e0){}
+          await rendition.display(href);
+          var target=null; try { target = book.spine.get(href); } catch(e1){}
+          var si = target ? target.index : -1;
+          var contents = (typeof rendition.getContents === 'function') ? rendition.getContents() : [];
+          var c=null;
+          for (var i=0;i<contents.length;i++){ if (si<0 || contents[i].sectionIndex===si){ c=contents[i]; break; } }
+          if (!c) c = contents[0];
+          var doc = c && c.document;
+          if (doc) {
+            var tw = doc.createTreeWalker(doc.body||doc, NodeFilter.SHOW_TEXT, null, false);
+            var nodes=[], raw='', node;
+            while (node = tw.nextNode()) { nodes.push({node:node, start:raw.length, len:node.textContent.length}); raw += node.textContent; }
+            var lower = raw.toLowerCase();
+            var normChars=[], map=[], prevSpace=true;
+            for (var k=0;k<lower.length;k++){
+              var ch=lower[k];
+              if (/\s/.test(ch)) { if (!prevSpace){ normChars.push(' '); map.push(k); } prevSpace=true; }
+              else { normChars.push(ch); map.push(k); prevSpace=false; }
+            }
+            var hay = normChars.join('');
+            var needle = excerpt.toLowerCase().replace(/\s+/g,' ').trim();
+            var pos = hay.indexOf(needle);
+            var rawStart = -1, rawEnd = -1;
+            if (pos !== -1) { rawStart = map[pos]; rawEnd = map[pos + needle.length - 1] + 1; }
+            else {
+              var sq = needle.replace(/ /g, ''), sh = [], smap = [];
+              for (var z = 0; z < hay.length; z++) { if (hay[z] !== ' ') { sh.push(hay[z]); smap.push(map[z]); } }
+              var spos = sq.length >= 8 ? sh.join('').indexOf(sq) : -1;
+              if (spos !== -1) { pos = spos; rawStart = smap[spos]; rawEnd = smap[spos + sq.length - 1] + 1; dbg.squeezed = true; }
+            }
+            dbg.pos = pos; dbg.hayLen = hay.length;
+            if (pos !== -1 && nodes.length) {
+              var locate = function(off){
+                for (var q=0;q<nodes.length;q++){ var e2=nodes[q]; if (off < e2.start + e2.len) return {node:e2.node, offset:off - e2.start}; }
+                var last = nodes[nodes.length-1]; return {node:last.node, offset:last.len};
+              };
+              var sp = locate(rawStart), ep = locate(rawEnd);
+              var r = doc.createRange();
+              r.setStart(sp.node, sp.offset); r.setEnd(ep.node, ep.offset);
+              var liveCfi = c.cfiFromRange(r);
+              if (liveCfi) { dbg.matched = true; dbg.cfi = liveCfi; await rendition.display(liveCfi); }
+            }
+          }
+          if (!dbg.matched && backCfi) { try { await rendition.display(backCfi); } catch(e3){} }
+        } catch(e){ dbg.err = String(e); if (backCfi) { try { await rendition.display(backCfi); } catch(e4){} } }
+        return JSON.stringify(dbg);
+      ''',
+      arguments: {'href': href, 'excerpt': excerpt},
+    ).timeout(const Duration(seconds: 30), onTimeout: () => null);
+    final raw = res?.value;
+    debugPrint('[FindEbook] anchor $raw');
+    if (raw is! String) return false;
+    try {
+      final d = jsonDecode(raw) as Map<String, dynamic>;
+      if (d['matched'] == true && d['cfi'] is String) {
+        if (flash) _highlightSearchHit(d['cfi'] as String);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  static const double _catchUpMinGapSeconds = 300;
+
+  /// Where the audiobook should be for the page at [cfi] and the range it
+  /// could sit in. Nothing is transcribed.
+  Future<({double est, double lo, double hi})?> _audioEstimateForPage(
+      String cfi) async {
+    final api = context.read<AuthProvider>().apiService;
+    final info = await _selectionSectionInfo(cfi, '');
+    if (info == null) return null;
+    return _audioLocator.estimate(info, api);
+  }
+
+  /// Offers to close a big gap between the page and the audiobook. Opening
+  /// the book only offers going to the audio; starting audio from here
+  /// ([audioStarting]) can offer either. Nothing moves until the toast is tapped.
+  Future<void> _maybeOfferCatchUp({required bool audioStarting}) async {
+    if (!mounted || !_readerActive || !_hasAudio || !_transcriptionOn) return;
+    // A narrated book keeps page and audio together by itself.
+    if (_useNarration) return;
+    if (_readAlongOn || _finding) return;
+    // These opens put a page on screen that is not where the reading stopped.
+    if (widget.findText != null ||
+        widget.openAtCfi != null ||
+        widget.startReadAlong) {
+      return;
+    }
+    if (_offeredPageToAudio && (_offeredAudioToPage || !audioStarting)) return;
+    final cfi = _currentCfi;
+    if (cfi == null || cfi.isEmpty) return;
+    final transcription = TranscriptionService.instance;
+    if (!transcription.canTranscribeBook(widget.itemId)) return;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.read<LibraryProvider>();
+    if (lib.getProgressData(widget.itemId)?['isFinished'] == true) return;
+    var hasModel = false;
+    for (final size in TranscriptionModelSize.values) {
+      if (await transcription.isModelDownloaded(size)) {
+        hasModel = true;
+        break;
+      }
+    }
+    if (!hasModel) return;
+    final player = AudioPlayerService();
+    final live = player.currentItemId == widget.itemId &&
+        player.currentEpisodeId == null;
+    final audioAt = live
+        ? player.position.inMilliseconds / 1000.0
+        : await ProgressSyncService().getSavedPosition(widget.itemId);
+    if (!mounted) return;
+    ({double est, double lo, double hi})? page;
+    try {
+      page = await _audioEstimateForPage(cfi);
+    } catch (e) {
+      debugPrint('[CatchUp] estimate failed: $e');
+    }
+    if (!mounted || page == null || _readAlongOn || _finding) return;
+    final gap = page.est - audioAt;
+    final apart = gap.abs() >= _catchUpMinGapSeconds &&
+        (audioAt < page.lo || audioAt > page.hi);
+    debugPrint('[CatchUp] page est=${page.est.toStringAsFixed(0)}s '
+        '(${page.lo.toStringAsFixed(0)}-${page.hi.toStringAsFixed(0)}s) '
+        'audio=${audioAt.toStringAsFixed(0)}s apart=$apart '
+        'audioStarting=$audioStarting');
+    if (!apart) return;
+    if (gap < 0) {
+      if (_offeredPageToAudio) return;
+      if (!audioStarting) {
+        // Already offered at this audio position.
+        final key = 'catchup_offered_at_${widget.itemId}';
+        final last = await ScopedPrefs.getDouble(key);
+        if (last != null && (last - audioAt).abs() < 120) return;
+        await ScopedPrefs.setDouble(key, audioAt);
+        if (!mounted) return;
+      }
+      _offeredPageToAudio = true;
+      showOverlayToast(context, l.catchUpAudioAhead,
+          icon: Icons.headphones_rounded,
+          onTap: () => _catchUpPageToAudio(audioAt));
+    } else {
+      if (!audioStarting || _offeredAudioToPage) return;
+      _offeredAudioToPage = true;
+      showOverlayToast(context, l.catchUpPageAhead,
+          icon: Icons.menu_book_rounded,
+          onTap: () => _findInAudiobookFromSelection(
+              cfiOverride: _currentCfi ?? cfi,
+              textOverride: '',
+              flashPassage: false));
+    }
+  }
+
+  /// Waits briefly for the audiobook's details and the first page.
+  Future<void> _catchUpOnOpen() async {
+    for (var i = 0;
+        i < 20 && mounted && (!_hasAudio || _currentCfi == null);
+        i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    if (!mounted) return;
+    if (_hasAudio && !_useNarration && await PlayerSettings.getSyncReadingListening()) {
+      // Kept in sync: listening that got ahead moves the page by itself.
+      final cfi = await ReadListenSync.instance.ebookSpotForReader(widget.itemId);
+      if (cfi == null || !mounted || !_holdOpenSpot || _readAlongOn) return;
+      debugPrint('[SyncSpot] opened behind the audio - going to $cfi');
+      _rememberSpot(EbookSpotReason.beforeSync);
+      await _epubController?.display(cfi: cfi);
+      if (mounted) {
+        showOverlayToast(context, AppLocalizations.of(context)!.syncEbookMoved,
+            icon: Icons.headphones_rounded);
+      }
+      return;
+    }
+    await _maybeOfferCatchUp(audioStarting: false);
+  }
+
+  /// Find in ebook from inside the reader, at the audiobook's position
+  /// ([savedAt] when this book is not the one loaded).
+  Future<void> _catchUpPageToAudio(double savedAt) async {
+    if (!mounted || _finding || _readAlongOn) return;
+    final l = AppLocalizations.of(context)!;
+    final api = context.read<AuthProvider>().apiService;
+    final player = AudioPlayerService();
+    final live = player.currentItemId == widget.itemId &&
+        player.currentEpisodeId == null;
+    final pos = live ? player.position.inMilliseconds / 1000.0 : savedAt;
+    showProgressDialog(context, l.transcribing);
+    String? text;
+    String? error;
+    try {
+      final r = await TranscriptionService.instance.transcribeAt(
+        itemId: widget.itemId,
+        positionSeconds: pos,
+        windowSeconds: findInEbookWindowSeconds,
+        leadSeconds: findInEbookWindowSeconds,
+        preferAccuracy: false,
+        feature: TranscriptionFeature.readAlong,
+      );
+      text = r.text.trim();
+      try {
+        final f = File(r.audioPath);
+        if (f.existsSync()) await f.delete();
+      } catch (_) {}
+    } on TranscriptionException catch (e) {
+      error = switch (e.kind) {
+        TranscriptionError.busy => l.transcriptionBusyMsg,
+        TranscriptionError.empty => l.transcriptionEmptyMsg,
+        TranscriptionError.modelMissing => l.transcriptionNoModelDownloaded,
+        TranscriptionError.notDownloaded => l.transcriptionNotDownloadedBook,
+        _ => l.transcriptionFailedMsg,
+      };
+    } catch (_) {
+      error = l.transcriptionFailedMsg;
+    }
+    if (!mounted) return;
+    Navigator.pop(context); // progress dialog
+    if (error != null || text == null || text.isEmpty) {
+      showOverlayToast(context, error ?? l.transcriptionEmptyMsg,
+          icon: Icons.error_outline_rounded);
+      return;
+    }
+    final audio = await resolveAudioChapters(widget.itemId, api);
+    if (!mounted) return;
+    String? chapterHint;
+    final chIdx =
+        ChapterLookup.indexAtWithGrace(audio.chapters, pos, audio.duration);
+    if (chIdx != null) {
+      final t = ((audio.chapters[chIdx] as Map<String, dynamic>)['title']
+              as String?)
+          ?.trim();
+      if (t != null && t.isNotEmpty) chapterHint = t;
+    }
+    await _runFindInEbook(text, chapterHint, positionSeconds: pos);
+  }
+
+  /// Reverse of Find in ebook: locate the selected text in the audio and start
+  /// listening there. Estimate from the audio chapter and how far through the
+  /// section's text the selection sits, then verify by transcribing a probe
+  /// window and fuzzy-matching it back into this section - the miss distance
+  /// in characters converts to seconds and corrects the estimate.
+  /// [cfiOverride]/[textOverride] let an existing highlight reuse this flow
+  /// without a live selection.
+  Future<void> _findInAudiobookFromSelection(
+      {String? cfiOverride,
+      String? textOverride,
+      bool flashPassage = true}) async {
+    final l = AppLocalizations.of(context)!;
+    final cfi = cfiOverride ?? _selectionCfi;
+    final selText = textOverride ?? _selectionText ?? '';
+    _dismissSelection();
+    if (cfi == null) return;
+    if (_useNarration) {
+      await _playNarrationFromCfi(cfi);
+      return;
+    }
+    if (!TranscriptionService.instance.canTranscribeBook(widget.itemId)) {
+      showOverlayToast(context, l.transcriptionNotDownloadedBook,
+          icon: Icons.download_rounded);
+      return;
+    }
+
+    // Set expectations (it listens for a while, a bad match moves nothing) and
+    // let the user pick where a successful find lands. Choice is remembered.
+    var after = await PlayerSettings.getFindInAudiobookAfter();
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          Widget option(String value, String label) => RadioListTile<String>(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(label),
+                value: value,
+                groupValue: after,
+                onChanged: (v) => setDialogState(() => after = v ?? after),
+              );
+          return AlertDialog(
+            icon: const Icon(Icons.headphones_rounded),
+            title: Text(l.findInAudiobook),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(l.findInAudiobookIntroBody),
+                const SizedBox(height: 16),
+                Text(l.findInAudiobookAfterLabel,
+                    style: Theme.of(ctx).textTheme.labelMedium?.copyWith(
+                        color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
+                const SizedBox(height: 4),
+                option('stay', l.findInAudiobookStay),
+                option('player', l.findInAudiobookGoPlayer),
+                option('readalong', l.readAlong),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: Text(l.cancel),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: Text(l.findInAudiobook),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (go != true || !mounted) return;
+    await PlayerSettings.setFindInAudiobookAfter(after);
+    if (!mounted) return;
+
+    final status = ValueNotifier<String>(l.findInAudiobookSearching);
+    showProgressDialogListenable(context, status);
+    // A long chapter can take a dozen ten-second probes; say so rather than
+    // spin in silence.
+    final slowTimer = Timer(const Duration(seconds: 10), () {
+      status.value = l.findInAudiobookStillSearching;
+    });
+    final longTimer = Timer(const Duration(seconds: 35), () {
+      status.value = l.findInAudiobookSearchingLong;
+    });
+    double? targetTime;
+    try {
+      targetTime = await _locateAudioForSelection(cfi, selText);
+    } catch (e) {
+      debugPrint('[FindAudio] failed: $e');
+    }
+    slowTimer.cancel();
+    longTimer.cancel();
+    if (!mounted) return;
+    Navigator.pop(context); // progress dialog
+    if (targetTime == null) {
+      showOverlayToast(context, l.findInAudiobookNotFound,
+          icon: Icons.search_off_rounded);
+      return;
+    }
+    await _startAudioAt(targetTime,
+        goToPlayer: after == 'player', passageCfi: flashPassage ? cfi : null);
+    // Third landing: stay in the reader and follow along from the spot the
+    // user highlighted, now that the audio is playing this book. playItem can
+    // resolve a beat before the player state settles - wait for it, or the
+    // toggle would reload the book and lose the found position.
+    if (after == 'readalong' && mounted && !_readAlongOn) {
+      for (var i = 0;
+          i < 20 && AudioPlayerService().currentItemId != widget.itemId;
+          i++) {
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
+      if (mounted) await _toggleReadAlong();
+    }
+  }
+
+  AudioLocator get _audioLocator => AudioLocator(widget.itemId, _ReaderBookText(this));
+
+  Future<double?> _locateAudioForSelection(String cfi, String selText) async {
+    final api = context.read<AuthProvider>().apiService;
+    final info = await _selectionSectionInfo(cfi, selText);
+    if (info == null) {
+      debugPrint('[FindAudio] selection offset not resolved');
+      return null;
+    }
+    return _audioLocator.locate(info, api);
+  }
+
+  /// Spine hrefs by spine index, for mapping neighboring sections to TOC and
+  /// audio chapters.
+  Future<List<String>> _spineHrefs() async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return const [];
+    final res = await wc.callAsyncJavaScript(functionBody: r'''
+      var out = [];
+      try {
+        var items = (book.spine && book.spine.spineItems) ? book.spine.spineItems : [];
+        for (var i = 0; i < items.length; i++) out.push(items[i].href || '');
+      } catch(e){}
+      return JSON.stringify(out);
+    ''');
+    final raw = res?.value;
+    if (raw is! String || raw.isEmpty) return const [];
+    try {
+      return (jsonDecode(raw) as List<dynamic>).cast<String>();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Text length in characters of each spine section from [from] to [to]
+  /// inclusive, via the separate search book (never the live one).
+  Future<List<double>> _sectionCharCounts(int from, int to) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null || to < from) return const [];
+    final res = await wc.callAsyncJavaScript(functionBody: r'''
+      var sb = window.__absorbSearchBook;
+      if (!sb) {
+        sb = ePub();
+        sb.spine.unpack(book.packaging, book.resolve.bind(book), book.canonical.bind(book));
+        window.__absorbSearchBook = sb;
+      }
+      var out = [];
+      var items = (sb.spine && sb.spine.spineItems) ? sb.spine.spineItems : [];
+      for (var i = from; i <= to && i < items.length; i++) {
+        var n = 0;
+        try {
+          await items[i].load(book.load.bind(book));
+          var d = items[i].document;
+          var text = d ? ((d.body && d.body.textContent) || (d.documentElement && d.documentElement.textContent) || '') : '';
+          n = text.length;
+        } catch(e){}
+        finally { try { items[i].unload(); } catch(e2){} }
+        out.push(n);
+      }
+      return JSON.stringify(out);
+    ''', arguments: {'from': from, 'to': to});
+    final raw = res?.value;
+    if (raw is! String || raw.isEmpty) return const [];
+    try {
+      return (jsonDecode(raw) as List<dynamic>)
+          .map((n) => (n as num).toDouble())
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Section index, character offset of the selection start, and the section's
+  /// total character count - resolved in the live DOM. Falls back to locating
+  /// the selected text when the CFI-to-range resolution fails.
+  Future<Map<String, dynamic>?> _selectionSectionInfo(
+      String cfi, String selText) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return null;
+    final res = await wc.callAsyncJavaScript(functionBody: r'''
+      var out = {};
+      try {
+        var contents = (typeof rendition.getContents === 'function') ? rendition.getContents() : [];
+        // The CFI names its spine section; only that section may resolve it.
+        // Chapter documents are structurally identical, so epub.js happily
+        // "resolves" a chapter-5 CFI inside a pre-rendered chapter-4 DOM at
+        // the same path - which sent Find in audiobook to the wrong chapter.
+        var wantSi = -1;
+        try {
+          var pos = new ePub.CFI(cfi).spinePos;
+          if (typeof pos === 'number' && pos >= 0) wantSi = pos;
+        } catch(eS){}
+        var ordered = [];
+        for (var i = 0; i < contents.length; i++) { if (contents[i].sectionIndex === wantSi) ordered.push(contents[i]); }
+        for (var i = 0; i < contents.length; i++) { if (contents[i].sectionIndex !== wantSi) ordered.push(contents[i]); }
+        for (var i = 0; i < ordered.length; i++) {
+          var c = ordered[i], doc = c.document;
+          if (!doc) continue;
+          var tw = doc.createTreeWalker(doc.body||doc, NodeFilter.SHOW_TEXT, null, false);
+          var nodes=[], text='', node;
+          while (node = tw.nextNode()) { nodes.push({node:node, start:text.length, len:node.textContent.length}); text += node.textContent; }
+          var off = -1, r = null;
+          if (wantSi < 0 || c.sectionIndex === wantSi) {
+            try { r = c.range(cfi); } catch(e){}
+          }
+          if (r) {
+            for (var k=0;k<nodes.length;k++){ if (nodes[k].node === r.startContainer) { off = nodes[k].start + r.startOffset; break; } }
+          }
+          if (off < 0 && selText) {
+            var p = text.toLowerCase().indexOf(selText.toLowerCase());
+            if (p !== -1) off = p;
+          }
+          if (off >= 0) {
+            var href = '';
+            try { var sec = book.spine.get(c.sectionIndex); href = sec ? sec.href : ''; } catch(e2){}
+            var pct = null;
+            try {
+              var nLoc = (typeof book.locations.length === 'function')
+                  ? book.locations.length() : (book.locations ? book.locations.length : 0);
+              if (nLoc) pct = book.locations.percentageFromCfi(cfi);
+            } catch(e3){}
+            out = { si: c.sectionIndex, offset: off, total: text.length, href: href, pct: pct };
+            break;
+          }
+        }
+      } catch(e){ out.err = String(e); }
+      return JSON.stringify(out);
+    ''', arguments: {'cfi': cfi, 'selText': selText});
+    final raw = res?.value;
+    debugPrint('[FindAudio] selectionInfo $raw');
+    if (raw is! String || raw.isEmpty) return null;
+    try {
+      final d = jsonDecode(raw) as Map<String, dynamic>;
+      if (d['si'] is num && d['offset'] is num && d['total'] is num) return d;
+    } catch (_) {}
+    return null;
+  }
+
+  /// Fuzzy-locates a probe transcript inside one live section's text. Same
+  /// token bag + Levenshtein scoring as the ebook-direction search, but scoped
+  /// to a single section that is already rendered.
+  Future<Map<String, dynamic>?> _locateTranscriptInSection(
+      int sectionIndex, String transcript) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return null;
+    final res = await wc.callAsyncJavaScript(functionBody: r'''
+      var out = null;
+      try {
+        var contents = (typeof rendition.getContents === 'function') ? rendition.getContents() : [];
+        var c = null;
+        for (var i=0;i<contents.length;i++){ if (contents[i].sectionIndex === si) { c = contents[i]; break; } }
+        if (!c) c = contents[0];
+        var doc = c && c.document;
+        if (doc) {
+          var tw = doc.createTreeWalker(doc.body||doc, NodeFilter.SHOW_TEXT, null, false);
+          var text='', node;
+          while (node = tw.nextNode()) text += node.textContent;
+          function toks(s){ return (s.toLowerCase().match(/[\p{L}\p{N}']+/gu) || []); }
+          function lev(a,b){
+            var m=a.length,n=b.length; if(!m)return n; if(!n)return m;
+            var prev=new Array(n+1), cur=new Array(n+1), x, j, tmp;
+            for(j=0;j<=n;j++)prev[j]=j;
+            for(x=1;x<=m;x++){ cur[0]=x; var ca=a.charCodeAt(x-1);
+              for(j=1;j<=n;j++){ var cost=(ca===b.charCodeAt(j-1))?0:1;
+                cur[j]=Math.min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost); }
+              tmp=prev; prev=cur; cur=tmp; }
+            return prev[n];
+          }
+          var T = toks(transcript);
+          if (T.length >= 3) {
+            var need = {}; T.forEach(function(t){ need[t]=(need[t]||0)+1; });
+            var tNorm = T.join(' ');
+            var W = T.length;
+            var st=[], re=/[\p{L}\p{N}']+/gu, mm;
+            while((mm=re.exec(text))!==null){ st.push({t:mm[0].toLowerCase(), s:mm.index, e:mm.index+mm[0].length}); }
+            if (st.length >= 3) {
+              var have={}, matched=0, cands=[], p;
+              for (p=0;p<st.length;p++){
+                var tk=st[p].t; have[tk]=(have[tk]||0)+1; if (have[tk] <= (need[tk]||0)) matched++;
+                if (p>=W){ var old=st[p-W].t; if (have[old] <= (need[old]||0)) matched--; have[old]--; }
+                if (matched >= Math.max(2, Math.floor(W*0.4))) cands.push({i:Math.max(0,p-W+1), m:matched});
+              }
+              cands.sort(function(a,b){ return b.m-a.m; });
+              var used=[], picked=[];
+              for (var cc=0;cc<cands.length && picked.length<4;cc++){
+                var s0=cands[cc].i, ok=true;
+                for (var u=0;u<used.length;u++){ if (Math.abs(used[u]-s0) < W) { ok=false; break; } }
+                if (ok){ picked.push(cands[cc]); used.push(s0); }
+              }
+              for (var pc=0;pc<picked.length;pc++){
+                var s1=picked[pc].i, e1=Math.min(st.length-1, s1+W-1);
+                var winNorm = st.slice(s1,e1+1).map(function(x2){return x2.t;}).join(' ');
+                var dl = lev(tNorm, winNorm);
+                var fine = 1 - dl/Math.max(tNorm.length, winNorm.length);
+                if (!out || fine > out.fine) out = { s: st[s1].s, e: st[e1].e, fine: fine };
+              }
+            }
+          }
+        }
+      } catch(e){ out = null; }
+      return JSON.stringify(out);
+    ''', arguments: {'si': sectionIndex, 'transcript': transcript});
+    final raw = res?.value;
+    if (raw is! String || raw.isEmpty || raw == 'null') return null;
+    try {
+      return jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Seek the audiobook to [seconds] and start playing, loading the book into
+  /// the player first when it isn't the current item. Position is decided
+  /// before playback starts. [goToPlayer] closes the reader and lands on the
+  /// player; otherwise the reader stays open while the audio plays, with
+  /// [passageCfi] flashed so the eye lands back on the matched passage.
+  Future<void> _startAudioAt(double seconds,
+      {required bool goToPlayer, String? passageCfi}) async {
+    final l = AppLocalizations.of(context)!;
+    final player = AudioPlayerService();
+
+    // For "Open the player", close the reader BEFORE playback starts: the
+    // shell's full-screen auto-expand is suppressed while the reader is open
+    // (so "Keep reading" can't get yanked into the player), which means it
+    // only fires for this path if the reader is already gone when play begins.
+    // Everything context-dependent is gathered first; the position was decided
+    // long before, so play still starts exactly where the match landed.
+    final api = context.read<AuthProvider>().apiService;
+    final lib = context.read<LibraryProvider>();
+    final needsLoad = player.currentItemId != widget.itemId;
+    Map<String, dynamic>? fullItem;
+    if (needsLoad) {
+      if (api == null) {
+        showOverlayToast(context, l.bookmarksNotConnected,
+            icon: Icons.cloud_off_rounded);
+        return;
+      }
+      fullItem = await api.getLibraryItem(widget.itemId);
+      if (fullItem == null) {
+        if (mounted) {
+          showOverlayToast(context, l.findInAudiobookNotFound,
+              icon: Icons.error_outline_rounded);
+        }
+        return;
+      }
+      if (!mounted) return;
+    }
+    final coverUrl = lib.getCoverUrl(widget.itemId);
+
+    if (goToPlayer && mounted) {
+      Navigator.of(context).pop(); // close the reader
+      AppShell.goToAbsorbingGlobal();
+    }
+
+    if (!needsLoad) {
+      await player.seekTo(Duration(milliseconds: (seconds * 1000).round()));
+      if (!player.isPlaying) player.play();
+    } else {
+      final media = fullItem!['media'] as Map<String, dynamic>? ?? {};
+      final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+      final error = await player.playItem(
+        api: api!,
+        itemId: widget.itemId,
+        title: metadata['title'] as String? ?? widget.title,
+        author: metadata['authorName'] as String? ?? '',
+        coverUrl: coverUrl,
+        totalDuration:
+            (media['duration'] is num) ? (media['duration'] as num).toDouble() : 0.0,
+        chapters: (media['chapters'] as List<dynamic>?) ?? [],
+        startTime: seconds,
+        forceStartTime: true,
+        libraryId: fullItem['libraryId'] as String?,
+      );
+      if (error != null) {
+        debugPrint('[FindAudio] playItem failed: $error');
+        if (mounted) {
+          showOverlayToast(context, error, icon: Icons.error_outline_rounded);
+        }
+        return;
+      }
+    }
+
+    if (!goToPlayer && mounted) {
+      if (passageCfi != null) {
+        _flashHighlight(passageCfi, duration: const Duration(seconds: 8));
+      }
+      showOverlayToast(context, l.findInAudiobookPlaying,
+          icon: Icons.headphones_rounded);
+    }
+  }
+
+  void _highlightSearchHit(String cfi) {
+    // The jump behind this ran display() twice in quick succession, which
+    // leaves the page/percent bar stale until the next page turn (the final
+    // relocated event never reaches the handlers - reportLocation() alone
+    // didn't fix it on device). Read the location directly and push the
+    // numbers into state ourselves.
+    _refreshLocationAfterJump();
+    _flashHighlight(cfi);
+  }
+
+  /// Load this book into the player and start it, for read along pressed
+  /// while something else (or nothing) is playing - pressing the feature IS
+  /// the intent to hear this book. False when it could not start (offline
+  /// with no API, or the item failed to load).
+  Future<bool> _ensureThisBookPlaying() async {
+    final player = AudioPlayerService();
+    if (player.currentItemId == widget.itemId &&
+        player.currentEpisodeId == null) {
+      if (!player.isPlaying) await player.play();
+      return true;
+    }
+    final api = context.read<AuthProvider>().apiService;
+    final lib = context.read<LibraryProvider>();
+    if (api == null) return false;
+    final fullItem = await api.getLibraryItem(widget.itemId);
+    if (fullItem == null || !mounted) return false;
+    final media = fullItem['media'] as Map<String, dynamic>? ?? {};
+    final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+    final error = await player.playItem(
+      api: api,
+      itemId: widget.itemId,
+      title: metadata['title'] as String? ?? widget.title,
+      author: metadata['authorName'] as String? ?? '',
+      coverUrl: lib.getCoverUrl(widget.itemId),
+      totalDuration:
+          (media['duration'] is num) ? (media['duration'] as num).toDouble() : 0.0,
+      chapters: (media['chapters'] as List<dynamic>?) ?? [],
+      libraryId: fullItem['libraryId'] as String?,
+    );
+    return error == null;
+  }
+
+  /// Toggle read along (episodes have no ebook). Reuses the live-transcript
+  /// pipeline for lines, so the cache is shared with the player overlay. A
+  /// book that isn't playing yet gets loaded and started - nobody presses
+  /// read along on a book they don't want to hear.
+  Future<void> _loadNarration(ApiService api, File epub) async {
+    try {
+      final n = await NarrationService.instance.overlayFor(api, widget.itemId, epub: epub);
+      if (n == null || !mounted) return;
+      _narrationApi = api;
+      _narrationLib = context.read<LibraryProvider>();
+      setState(() {
+        _narration = n.overlay;
+        _narrationFromServer = n.fromServer;
+      });
+      unawaited(_narrationOpenAtAudio());
+      debugPrint('[ReadAlong] ${widget.itemId} is narrated (${n.fromServer ? 'server' : 'EPUB'}): '
+          '${n.overlay.clips.length} sentences');
+    } catch (e) {
+      debugPrint('[ReadAlong] narration check failed: $e');
+    }
+  }
+
+  /// The narrated sentence named by a script answer of {href, ids}: the
+  /// first id in it that the narration reads.
+  OverlayClip? _narrationClipIn(Object? raw) {
+    final n = _narration;
+    if (n == null || raw is! String || raw.isEmpty) return null;
+    final page = jsonDecode(raw) as Map<String, dynamic>;
+    final href = page['href'] as String? ?? '';
+    final byId = <String, OverlayClip>{};
+    for (final c in n.clips) {
+      final f = c.fragment;
+      if (f != null && MediaOverlay.sameDoc(c.textHref, href)) byId.putIfAbsent(f, () => c);
+    }
+    for (final id in (page['ids'] as List<dynamic>? ?? const []).whereType<String>()) {
+      final c = byId[id];
+      if (c != null) return c;
+    }
+    return n.clipFor(href, null);
+  }
+
+  /// The first narrated sentence on the page in view.
+  Future<OverlayClip?> _narrationClipOnPage() async {
+    final wc = _epubController?.webViewController;
+    if (_narration == null || wc == null) return null;
+    try {
+      await wc.evaluateJavascript(source: _narrationBootstrapSource());
+      return _narrationClipIn(await wc.evaluateJavascript(
+          source: 'window.__absorbMO ? __absorbMO.onPage() : ""'));
+    } catch (e) {
+      debugPrint('[ReadAlong] narration page lookup failed: $e');
+      return null;
+    }
+  }
+
+  /// The book time of the first narrated sentence on the page in view.
+  Future<double?> _narrationTimeOnPage() async {
+    final clip = await _narrationClipOnPage();
+    final n = _narration;
+    return clip == null || n == null ? null : n.startOf(clip);
+  }
+
+  /// Plays the narration from the sentence [from]: a seek when this book is
+  /// already in the player, otherwise a start there. An Audiobookshelf book
+  /// gets its narration onto the phone first, with how far along that is.
+  /// Null when the download question took over and nothing more needs saying.
+  Future<bool?> _playNarrationFrom(OverlayClip? from) async {
+    final player = AudioPlayerService();
+    final n = _narration;
+    if (player.currentItemId == widget.itemId && player.currentEpisodeId == null) {
+      if (from != null && n != null) {
+        await player.seekTo(Duration(milliseconds: (n.startOf(from) * 1000).round()));
+      }
+      if (!player.isPlaying) await player.play(fromUi: true);
+      return true;
+    }
+    final api = context.read<AuthProvider>().apiService;
+    if (api == null) return false;
+    final cover = context.read<LibraryProvider>().getCoverUrl(widget.itemId);
+    if (!api.isBookOrbit && !NarrationService.instance.hasLocalAudio(widget.itemId)) {
+      await showNarrationDownloadDialog(context,
+          itemId: widget.itemId,
+          title: widget.title,
+          coverUrl: cover,
+          libraryId: context.read<LibraryProvider>().selectedLibraryId);
+      return null;
+    }
+    final item = await api.getLibraryItem(widget.itemId);
+    if (item == null || !mounted) return false;
+    var ok = false;
+    try {
+      ok = await NarrationService.instance.play(api, item, from: from, coverUrl: cover);
+    } catch (e) {
+      debugPrint('[ReadAlong] starting the narration failed: $e');
+    }
+    return ok;
+  }
+
+  /// "Play from here" on a narrated book: the selected sentence's own timing,
+  /// then read along from it.
+  Future<void> _playNarrationFromCfi(String cfi) async {
+    final l = AppLocalizations.of(context)!;
+    final n = _narration;
+    final wc = _epubController?.webViewController;
+    if (n == null || wc == null) return;
+    OverlayClip? clip;
+    try {
+      await wc.evaluateJavascript(source: _narrationBootstrapSource());
+      clip = _narrationClipIn(await wc.evaluateJavascript(
+          source: 'window.__absorbMO ? __absorbMO.idsAt(${jsonEncode(cfi)}) : ""'));
+    } catch (e) {
+      debugPrint('[ReadAlong] selection lookup failed: $e');
+    }
+    if (!mounted) return;
+    if (clip == null) {
+      showOverlayToast(context, l.findInAudiobookNotFound, icon: Icons.search_off_rounded);
+      return;
+    }
+    debugPrint('[ReadAlong] play from the selection: ${clip.textHref}#${clip.fragment} '
+        'at ${n.startOf(clip).toStringAsFixed(1)}s');
+    final ok = await _playNarrationFrom(clip);
+    if (ok == null || !mounted) return;
+    if (!ok) {
+      showOverlayToast(context, l.narrationNone, icon: Icons.headphones_rounded);
+      return;
+    }
+    if (!_readAlongOn) await _startNarrationReadAlong();
+  }
+
+  bool _narrationOpenedAtAudio = false;
+
+  /// Opening the reader on a narrated book: go to the sentence the audio is
+  /// on. Reading ahead moved the audio along when the reader closed, so this
+  /// is where both left off; Read stands in for Find in ebook on these.
+  Future<void> _narrationOpenAtAudio() async {
+    final n = _narration;
+    if (_narrationOpenedAtAudio || n == null || !_useNarration || !_didLoadRescue) return;
+    if (widget.openAtCfi != null || widget.findText != null || widget.startReadAlong) return;
+    _narrationOpenedAtAudio = true;
+    final player = AudioPlayerService();
+    // Find in ebook names the spot, whether or not it is ahead of the page.
+    double? at = widget.openAtAudioSeconds;
+    if (at == null && player.currentItemId == widget.itemId && player.currentEpisodeId == null) {
+      at = player.position.inMilliseconds / 1000.0;
+    } else if (at == null) {
+      final local = await ProgressSyncService().getLocal(widget.itemId);
+      final saved = _narrationLib?.getProgressData(widget.itemId);
+      final localAt = (local?['timestamp'] as num?)?.toInt() ?? 0;
+      final savedAt = (saved?['lastUpdate'] as num?)?.toInt() ?? 0;
+      final newer = local == null
+          ? saved
+          : saved == null
+              ? local
+              : (localAt >= savedAt ? local : saved);
+      final heard = (newer?['currentTime'] as num?)?.toDouble() ?? 0;
+      if (heard <= 0) return;
+      // Already on the sentence the audio stopped at: nothing moves.
+      final readAt = await _narrationTimeOnPage();
+      if (readAt != null && (heard - readAt).abs() <= 1) return;
+      at = heard;
+    }
+    if (!mounted) return;
+    final clip = n.clipAt(at);
+    final id = clip?.fragment;
+    final wc = _epubController?.webViewController;
+    if (clip == null || id == null || wc == null) return;
+    debugPrint('[ReadAlong] opened while the narration is at ${clip.textHref}#$id - going there');
+    _rememberSpot(EbookSpotReason.beforeSync);
+    await wc.evaluateJavascript(source: _narrationBootstrapSource());
+    await wc.evaluateJavascript(
+        source: 'window.__absorbMO && __absorbMO.go(${jsonEncode(clip.textHref)}, ${jsonEncode(id)})');
+  }
+
+  // Where reading has got to in narration time, noted as pages turn, so
+  // leaving by any route can hand it to the narration without the page.
+  double? _narrationReadAt;
+  Timer? _narrationSpotTimer;
+  ApiService? _narrationApi;
+  LibraryProvider? _narrationLib;
+
+  void _noteNarrationSpot() {
+    _narrationSpotTimer?.cancel();
+    _narrationSpotTimer = Timer(const Duration(milliseconds: 1200), () async {
+      if (!mounted || _readAlongOn) return;
+      final t = await _narrationTimeOnPage();
+      if (t != null) _narrationReadAt = t;
+    });
+  }
+
+  /// Reading ahead of the narration, then leaving the reader: the narration
+  /// moves to the page you reached, so play picks up where you were reading.
+  /// Uses nothing from the page or the widget tree, so it can run on dispose.
+  Future<void> _narrationCarryReadingSpot() async {
+    final n = _narration;
+    final t = _narrationReadAt;
+    if (n == null || t == null || !_useNarration || _readAlongOn) return;
+    _narrationReadAt = null;
+    final player = AudioPlayerService();
+    final inPlayer = player.currentItemId == widget.itemId && player.currentEpisodeId == null;
+    if (inPlayer && player.isPlaying) return;
+    final local = await ProgressSyncService().getLocal(widget.itemId);
+    final heard = inPlayer
+        ? player.position.inMilliseconds / 1000.0
+        : (local?['currentTime'] as num?)?.toDouble() ??
+            (_narrationLib?.getProgressData(widget.itemId)?['currentTime'] as num?)?.toDouble() ??
+            0;
+    if (t <= heard + 20) return;
+    debugPrint('[ReadAlong] read ahead of the narration '
+        '(${heard.toStringAsFixed(0)}s -> ${t.toStringAsFixed(0)}s) - moving it to the page');
+    if (inPlayer) {
+      await player.seekTo(Duration(milliseconds: (t * 1000).round()));
+      return;
+    }
+    final duration = n.duration;
+    await ProgressSyncService().saveLocal(
+      itemId: widget.itemId,
+      currentTime: t,
+      duration: duration,
+      speed: (local?['speed'] as num?)?.toDouble() ?? 1.0,
+    );
+    try {
+      await _narrationApi?.updateProgress(widget.itemId, currentTime: t, duration: duration);
+    } catch (e) {
+      debugPrint('[ReadAlong] narration spot not sent: $e');
+    }
+  }
+
+  String _narrationBootstrapSource() =>
+      narrationBootstrap(LyricsService.instance.readAlongColor, eink: PlayerSettings.einkMode);
+
+  /// Read along from the narration's own timings. A book that isn't playing
+  /// starts at the first sentence on the page in view.
+  Future<void> _startNarrationReadAlong({bool fromResume = false}) async {
+    final l = AppLocalizations.of(context)!;
+    final player = AudioPlayerService();
+    final playingThis =
+        player.currentItemId == widget.itemId && player.currentEpisodeId == null;
+    if (!playingThis) {
+      if (fromResume) return;
+      final ok = await _playNarrationFrom(await _narrationClipOnPage());
+      if (ok == null || !mounted) return;
+      if (!ok) {
+        showOverlayToast(context, l.readAlongNeedsPlaying, icon: Icons.headphones_rounded);
+        return;
+      }
+    }
+    if (_autoScroll) {
+      await _epubController?.autoScrollStop();
+      if (mounted) {
+        setState(() {
+          _autoScroll = false;
+          _autoScrollPaused = false;
+        });
+      }
+    }
+    await _epubController?.webViewController
+        ?.evaluateJavascript(source: _narrationBootstrapSource());
+    _narrationWentTo = null;
+    _readAlongColor = LyricsService.instance.readAlongColor;
+    if (mounted) {
+      setState(() {
+        _readAlongOn = true;
+        _narrationReadAlong = true;
+        _readAlongBrowsing = false;
+      });
+    }
+    ScreenWake.hold('reader', true);
+    _readAlongTimer?.cancel();
+    _readAlongTimer = Timer.periodic(
+        const Duration(milliseconds: 150), (_) => _narrationTick());
+    debugPrint('[ReadAlong] following the narration for ${widget.itemId}');
+  }
+
+  Future<void> _narrationTick({bool force = false}) async {
+    final n = _narration;
+    if (!mounted || !_readAlongOn || !_narrationReadAlong || n == null) return;
+    if (_narrationTickBusy) return;
+    final player = AudioPlayerService();
+    if (player.currentItemId != widget.itemId) {
+      _stopReadAlong();
+      return;
+    }
+    final clip = n.clipAt(player.position.inMilliseconds / 1000.0);
+    final id = clip?.fragment;
+    if (clip == null || id == null) return;
+    final wc = _epubController?.webViewController;
+    if (wc == null) return;
+    _narrationTickBusy = true;
+    try {
+      if (LyricsService.instance.readAlongColor != _readAlongColor) {
+        _readAlongColor = LyricsService.instance.readAlongColor;
+        await wc.evaluateJavascript(
+            source: 'window.__absorbMO && __absorbMO.setColor("${cssHex(_readAlongColor)}")');
+      }
+      var where = await wc.evaluateJavascript(
+          source: 'window.__absorbMO ? __absorbMO.show(${jsonEncode(clip.textHref)}, ${jsonEncode(id)}) : ""');
+      if (where == '' || where == null) {
+        // A layout change remounts the page and its script goes with it.
+        await wc.evaluateJavascript(source: _narrationBootstrapSource());
+        where = await wc.evaluateJavascript(
+            source: 'window.__absorbMO ? __absorbMO.show(${jsonEncode(clip.textHref)}, ${jsonEncode(id)}) : ""');
+      }
+      if (where is String && where != _narrationWhere && mounted) {
+        setState(() => _narrationWhere = where as String);
+      }
+      if (_readAlongBrowsing) {
+        // The narration reached the page being browsed: follow it again.
+        if (_narrationOnScreen && DateTime.now().difference(_readAlongBrowseAt) > const Duration(seconds: 2)) {
+          if (mounted) setState(() => _readAlongBrowsing = false);
+        }
+        return;
+      }
+      final now = DateTime.now();
+      if (!force && now.difference(_narrationTurnAt) < const Duration(milliseconds: 700)) return;
+      if (_scroll && (where == 'after' || where == 'before' || where == 'low')) {
+        _narrationTurnAt = now;
+        await wc.evaluateJavascript(
+            source: 'window.__absorbMO && __absorbMO.reveal(${jsonEncode(clip.textHref)}, ${jsonEncode(id)})');
+      } else if (where == 'after' || where == 'before') {
+        _narrationTurnAt = now;
+        _readAlongTurnPending = now;
+        unawaited(_turnPage(where == 'after', fresh: true));
+      } else if (where == 'missing' && !identical(_narrationWentTo, clip)) {
+        _narrationWentTo = clip;
+        _narrationTurnAt = now;
+        _readAlongTurnPending = now;
+        debugPrint('[ReadAlong] narration moved to ${clip.textHref}#$id');
+        await wc.evaluateJavascript(
+            source: 'window.__absorbMO && __absorbMO.go(${jsonEncode(clip.textHref)}, ${jsonEncode(id)})');
+      }
+    } catch (e) {
+      debugPrint('[ReadAlong] narration tick failed: $e');
+    } finally {
+      _narrationTickBusy = false;
+    }
+  }
+
+  Future<void> _toggleReadAlong() async {
+    final l = AppLocalizations.of(context)!;
+    if (_readAlongOn) {
+      _stopReadAlong();
+      return;
+    }
+    // Following the book's own narration or transcribing depends on what the
+    // book is, so a tap in the first moments waits for that answer.
+    final lookups = [
+      if (_narrationLookup != null) _narrationLookup!,
+      if (_audioMetaLookup != null) _audioMetaLookup!,
+    ];
+    if (lookups.isNotEmpty) {
+      await Future.wait(lookups).timeout(const Duration(seconds: 8), onTimeout: () => const []);
+      if (!mounted) return;
+    }
+    if (_useNarration) {
+      await _startNarrationReadAlong();
+      return;
+    }
+    debugPrint('[ReadAlong] ${widget.itemId} is not narrated here - transcribing to follow along');
+    final player = AudioPlayerService();
+    if (player.currentItemId != widget.itemId ||
+        player.currentEpisodeId != null) {
+      final ok = await _ensureThisBookPlaying();
+      if (!ok || !mounted) {
+        if (mounted) {
+          showOverlayToast(context, l.readAlongNeedsPlaying,
+              icon: Icons.headphones_rounded);
+        }
+        return;
+      }
+    }
+    if (!await PlayerSettings.getTranscriptionEnabled()) {
+      if (mounted) {
+        showOverlayToast(context, l.transcriptionDisabledHint,
+            icon: Icons.record_voice_over_rounded);
+      }
+      return;
+    }
+    if (!TranscriptionService.instance.canTranscribeBook(widget.itemId)) {
+      if (mounted) {
+        await promptDownloadForTranscription(context,
+            itemId: widget.itemId, title: widget.title);
+      }
+      return;
+    }
+    await _startReadAlong();
+  }
+
+  /// Picks read along back up after the app was backgrounded, without
+  /// touching playback: coming back must never pause what you are hearing.
+  Future<void> _resumeReadAlong() async {
+    final player = AudioPlayerService();
+    bool stillWanted() =>
+        mounted &&
+        _readerActive &&
+        !_readAlongOn &&
+        player.currentItemId == widget.itemId &&
+        player.currentEpisodeId == null;
+    if (!stillWanted()) return;
+    if (_useNarration) {
+      debugPrint('[ReadAlong] back in the foreground - following the narration again');
+      await _startNarrationReadAlong(fromResume: true);
+      return;
+    }
+    if (!await PlayerSettings.getTranscriptionEnabled()) return;
+    if (!stillWanted() ||
+        !TranscriptionService.instance.canTranscribeBook(widget.itemId)) {
+      return;
+    }
+    debugPrint('[ReadAlong] back in the foreground - picking up again');
+    await _startReadAlong(holdPlayback: false);
+  }
+
+  Future<void> _startReadAlong({bool holdPlayback = true}) async {
+    final player = AudioPlayerService();
+    // Read along turns the pages itself, so the blind can't run at the same
+    // time - one of them has to own the page.
+    if (_autoScroll) {
+      await _epubController?.autoScrollStop();
+      if (mounted) setState(() {
+        _autoScroll = false;
+        _autoScrollPaused = false;
+      });
+    }
+    // Pause first: the runway fills faster against a still playhead, and
+    // nobody wants to hear words the page can't show yet. A playing book
+    // resumes by itself once ready; a paused one gets a toast.
+    final wasPlaying = player.isPlaying;
+    final hold = holdPlayback && wasPlaying;
+    if (hold) await player.pause();
+    _readAlongGateArmed = false;
+    _readAlongGatePaused = hold;
+    _readAlongGateWaiting = !wasPlaying;
+    if (mounted) {
+      setState(() {
+        _readAlongOn = true;
+        _readAlongPrep = 'finding';
+      });
+    }
+    // Go to where the audio is before anything else. Waiting for the first
+    // sentence to arrive and then paging forward from the saved spot took a
+    // page turn per page between the two.
+    await _readAlongJumpToAudio();
+    if (!mounted || !_readAlongOn) return;
+    setState(() => _readAlongPrep = 'listening');
+    if (!LyricsService.instance.isOn) {
+      await LyricsService.instance.enableForCurrent();
+      _readAlongStartedPipeline = true;
+    }
+    if (!mounted || !_readAlongOn) return;
+    LyricsService.instance.readerOwns = true;
+    _readAlongColor = LyricsService.instance.readAlongColor;
+    _readAlongMode = LyricsService.instance.readAlongMode;
+    _readAlongLastPos = player.position.inMilliseconds / 1000.0;
+    final wc = _epubController?.webViewController;
+    await wc?.evaluateJavascript(source: _readAlongBootstrapSource());
+    await wc?.evaluateJavascript(
+        source: 'window.__absorbRA && __absorbRA.start()');
+    // The first anchor may be behind the page you left the reader on.
+    _readAlongAllowBack = true;
+    _readAlongLastMatch = DateTime.now();
+    _readAlongLost = false;
+    _readAlongBrowsing = false;
+    _readAlongSeekAt = null;
+    ScreenWake.hold('reader', true);
+    _readAlongTimer?.cancel();
+    // 100ms so a word is never skipped at 2x: the sweep below moves at most
+    // one word per tick, ten words a second.
+    _readAlongTimer = Timer.periodic(
+        const Duration(milliseconds: 100), (_) => _readAlongTick());
+    debugPrint('[ReadAlong] enabled for ${widget.itemId}');
+  }
+
+  // Word by word repaints the page several times a second; on e-ink every
+  // one is a flash, so there read along follows by sentence whatever the
+  // setting says.
+  bool get _readAlongWordMode =>
+      !PlayerSettings.einkMode && LyricsService.instance.readAlongMode == 'word';
+
+  String _readAlongBootstrapSource() {
+    final p = _resolvePalette(context);
+    return readAlongBootstrap(_readAlongColor,
+        eink: PlayerSettings.einkMode,
+        fgArgb: p.fgColor.toARGB32(),
+        bgArgb: p.bgColor.toARGB32());
+  }
+
+  /// Put the page where the audio is. The book's own lines at the playhead
+  /// are the best needle when the transcript already has them; otherwise
+  /// listen to a short window around the playhead. Not finding it is not
+  /// fatal - the whole-book scan still runs once lines arrive.
+  Future<void> _readAlongJumpToAudio() async {
+    final player = AudioPlayerService();
+    final pos = player.position.inMilliseconds / 1000.0;
+    String? chapterHint;
+    final chapters = player.chapters;
+    final chIdx =
+        ChapterLookup.indexAtWithGrace(chapters, pos, player.totalDuration);
+    if (chIdx != null) {
+      final t = ((chapters[chIdx] as Map<String, dynamic>)['title'] as String?)
+          ?.trim();
+      if (t != null && t.isNotEmpty) chapterHint = t;
+    }
+    final store = TranscriptLineStore.instance;
+    String? text;
+    var source = 'transcript';
+    final near = store.lineNear(widget.itemId, pos, holdAfter: 4, preShow: 4);
+    if (near != null && near.exact && !near.approx) {
+      final run = store
+          .fromLine(widget.itemId, near.start, 3)
+          .where((l) => l.exact && !l.approx)
+          .map((l) => l.text.trim())
+          .join(' ');
+      text = run.isEmpty ? near.text.trim() : run;
+      source = 'cached lines';
+    }
+    Map<String, dynamic>? decision;
+    var err = 4.0;
+    try {
+      if (text != null) {
+        decision = await _decideFindTarget(text, chapterHint,
+            nearSeconds: pos);
+      }
+      // Whisper around the playhead: a short window first, a longer one if
+      // the words were too ordinary to pin down.
+      for (final window in const [12.0, 30.0]) {
+        if (decision != null || !mounted || !_readAlongOn) break;
+        final r = await _transcribeForJump(pos, window);
+        if (r == null) break;
+        source = '${window.toStringAsFixed(0)}s window';
+        err = window / 2;
+        decision = await _decideFindTarget(r, chapterHint, nearSeconds: pos);
+      }
+    } catch (e) {
+      debugPrint('[ReadAlong] find place failed: $e');
+    }
+    if (!mounted || !_readAlongOn) return;
+    if (decision == null) {
+      debugPrint('[ReadAlong] could not place the audio in the book '
+          '(pos ${pos.toStringAsFixed(1)}s, $source) - following from here');
+      return;
+    }
+    final jumped = await _jumpToFindHit(
+        decision['href'] as String, decision['excerpt'] as String);
+    debugPrint('[ReadAlong] placed the audio at ${pos.toStringAsFixed(1)}s '
+        'via $source -> ${decision['href']} jumped=$jumped');
+    // The window sat around the playhead, so its middle is where the audio
+    // was. The lines that follow pin it exactly.
+    if (jumped && decision['s'] is num && decision['e'] is num) {
+      final mid = ((decision['s'] as num) + (decision['e'] as num)) / 2;
+      unawaited(_rememberEbookHit(decision, pos, mid, err));
+    }
+  }
+
+  /// A transcript of [window] seconds around [pos], or null when the engine
+  /// can't (busy for too long, nothing downloaded, silence).
+  Future<String?> _transcribeForJump(double pos, double window) async {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      try {
+        final r = await TranscriptionService.instance.transcribeAt(
+          itemId: widget.itemId,
+          positionSeconds: pos + window / 2,
+          windowSeconds: window,
+          leadSeconds: window,
+          preferAccuracy: false,
+          feature: TranscriptionFeature.readAlong,
+        );
+        try {
+          final f = File(r.audioPath);
+          if (f.existsSync()) await f.delete();
+        } catch (_) {}
+        final t = r.text.trim();
+        return t.isEmpty ? null : t;
+      } on TranscriptionException catch (e) {
+        if (e.kind == TranscriptionError.busy) {
+          await Future.delayed(const Duration(milliseconds: 700));
+          if (!mounted || !_readAlongOn) return null;
+          continue;
+        }
+        debugPrint('[ReadAlong] find place transcription failed: $e');
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /// Centre-screen card while read along gets going, like Find in ebook's:
+  /// what it is doing and how far along the runway is.
+  Widget _readAlongPrepCard(Color bg, Color fg, Color accent) {
+    final svc = LyricsService.instance;
+    return AnimatedBuilder(
+      animation: svc,
+      builder: (ctx, _) {
+        final l = AppLocalizations.of(ctx)!;
+        final listening = _readAlongPrep == 'listening';
+        final gate = svc.gateProgress;
+        final text = listening
+            ? (gate != null && gate > 0
+                ? '${l.lyricsListeningAhead} ${(gate * 100).round()}%'
+                : l.lyricsListeningAhead)
+            : l.findInEbookSearching;
+        // An indeterminate bar animates forever, which e-ink hates.
+        final value = listening ? gate : (PlayerSettings.einkMode ? 0.0 : null);
+        return Container(
+          width: 280,
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: fg.withValues(alpha: 0.15)),
+            boxShadow: PlayerSettings.einkMode
+                ? null
+                : [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.18),
+                      blurRadius: 18,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(listening ? Icons.hearing_rounded : Icons.manage_search_rounded,
+                      size: 18, color: fg.withValues(alpha: 0.7)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      text,
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: fg.withValues(alpha: 0.9)),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(3),
+                child: LinearProgressIndicator(
+                  value: value,
+                  minHeight: 5,
+                  backgroundColor: fg.withValues(alpha: 0.1),
+                  valueColor: AlwaysStoppedAnimation(accent),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// The same transcript sync adjuster the player overlay has, for tuning
+  /// read along against Bluetooth latency without leaving the reader. Lives
+  /// in the bottom chrome, so it is there whenever the controls are.
+  Widget _backToNarrationButton(Color accent) {
+    return FilledButton.tonalIcon(
+      onPressed: _backToNarration,
+      icon: const Icon(Icons.my_location_rounded, size: 16),
+      label: Text(AppLocalizations.of(context)!.readAlongBackToNarration),
+      style: FilledButton.styleFrom(
+        visualDensity: VisualDensity.compact,
+        backgroundColor: accent.withValues(alpha: 0.18),
+        foregroundColor: accent,
+      ),
+    );
+  }
+
+  Widget _readAlongSyncPill(Color fg) {
+    final svc = LyricsService.instance;
+    // The start-up card already says what the pill would, in the middle of
+    // the page; showing both reads as two different things happening.
+    if (_readAlongPrep != null) return const SizedBox.shrink();
+    return AnimatedBuilder(
+      animation: svc,
+      builder: (context, _) {
+        if (_readAlongLost) {
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: fg.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.hearing_disabled_rounded,
+                    size: 13, color: fg.withValues(alpha: 0.6)),
+                const SizedBox(width: 8),
+                Text(
+                  AppLocalizations.of(context)!.readAlongLost,
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: fg.withValues(alpha: 0.75)),
+                ),
+              ],
+            ),
+          );
+        }
+        // After the gate, a seek can still land outside the transcript; the
+        // next chunk takes a few seconds and until then nothing lights up.
+        final gate = svc.gateProgress ?? (svc.buffering ? 0.0 : null);
+        if (gate != null) {
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: fg.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    value: gate > 0 ? gate : null,
+                    strokeWidth: 2,
+                    color: fg.withValues(alpha: 0.6),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  gate > 0
+                      ? '${AppLocalizations.of(context)!.lyricsListeningAhead} '
+                          '${(gate * 100).round()}%'
+                      : AppLocalizations.of(context)!.lyricsListeningAhead,
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: fg.withValues(alpha: 0.75)),
+                ),
+              ],
+            ),
+          );
+        }
+        final ms = svc.offsetMs;
+        final label = ms == 0
+            ? '0'
+            : '${ms > 0 ? '+' : '-'}${(ms.abs() / 1000).toStringAsFixed(2)}s';
+        Widget button(IconData icon, int delta) => GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => svc.nudgeOffset(delta),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                child: Icon(icon, size: 16, color: fg.withValues(alpha: 0.75)),
+              ),
+            );
+        return Container(
+          decoration: BoxDecoration(
+            color: fg.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(left: 10, right: 2),
+                child: Icon(
+                    svc.onBluetooth
+                        ? Icons.bluetooth_rounded
+                        : Icons.volume_up_rounded,
+                    size: 13,
+                    color: fg.withValues(alpha: 0.5)),
+              ),
+              button(Icons.remove_rounded, -50),
+              // Long press to drop back to no offset.
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPress: svc.clearOffset,
+                child: SizedBox(
+                  width: 52,
+                  child: Text(label,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: fg.withValues(alpha: 0.75))),
+                ),
+              ),
+              button(Icons.add_rounded, 50),
+              const SizedBox(width: 4),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _stopReadAlong() {
+    _readAlongTimer?.cancel();
+    _readAlongTimer = null;
+    _flushEbookPush();
+    if (_narrationReadAlong) {
+      _narrationReadAlong = false;
+      _narrationWentTo = null;
+      try {
+        _epubController?.webViewController
+            ?.evaluateJavascript(source: 'window.__absorbMO && __absorbMO.clear()')
+            .catchError((_) => null);
+      } catch (_) {}
+    }
+    // Runs from dispose() too, when the WebView may already be on its way out.
+    try {
+      _epubController?.webViewController
+          ?.evaluateJavascript(source: 'window.__absorbRA && __absorbRA.stop()')
+          .catchError((_) => null);
+    } catch (_) {}
+    _readAlongLineStart = null;
+    _readAlongPageWords = 0;
+    _readAlongLineWords = 0;
+    _readAlongWordIndex = -1;
+    _readAlongAt = -1;
+    _readAlongAllowBack = false;
+    _readAlongSeekAt = null;
+    _readAlongLastMatch = null;
+    _readAlongLost = false;
+    _readAlongBrowsing = false;
+    _readAlongGateArmed = false;
+    _readAlongGateWaiting = false;
+    if (_readAlongPrep != null) {
+      _readAlongPrep = null;
+      if (mounted) setState(() {});
+    }
+    // Leaving during the wait: put playback back the way it was found, or
+    // the book sits paused with nothing on screen to say why.
+    if (_readAlongGatePaused) {
+      _readAlongGatePaused = false;
+      final player = AudioPlayerService();
+      if (!player.isPlaying && player.currentItemId == widget.itemId) {
+        debugPrint('[ReadAlong] stopped while paused for the runway, resuming');
+        unawaited(player.play(logDetail: 'read along stopped', fromUi: true));
+      }
+    }
+    LyricsService.instance.readerOwns = false;
+    _syncScreenWake();
+    if (_readAlongStartedPipeline) {
+      LyricsService.instance.disable();
+      _readAlongStartedPipeline = false;
+    }
+    if (mounted && _readAlongOn) setState(() => _readAlongOn = false);
+  }
+
+  Future<void> _readAlongTick() async {
+    if (!mounted || !_readAlongOn) return;
+    final player = AudioPlayerService();
+    if (player.currentItemId != widget.itemId) {
+      _stopReadAlong();
+      return;
+    }
+    final svc = LyricsService.instance;
+    // Changing the color or word/sentence tracking in settings applies without
+    // leaving the reader.
+    if (svc.readAlongColor != _readAlongColor) {
+      _readAlongColor = svc.readAlongColor;
+      _epubController?.webViewController?.evaluateJavascript(
+          source: 'window.__absorbRA && '
+              '__absorbRA.setColor("${cssHex(_readAlongColor)}")');
+    }
+    if (svc.readAlongMode != _readAlongMode) {
+      _readAlongMode = svc.readAlongMode;
+      _readAlongLineStart = null;
+    }
+    // Same runway gate as the live transcript: painting before it is banked
+    // means the first stall leaves the page stuck on a stale sentence.
+    if (svc.gateProgress != null) {
+      if (_readAlongGateArmed) {
+        _readAlongGateArmed = false;
+        if (player.isPlaying) {
+          _readAlongGatePaused = true;
+          debugPrint('[ReadAlong] pausing while the runway builds');
+          await player.pause();
+        } else {
+          _readAlongGateWaiting = true;
+        }
+      } else if (_readAlongGatePaused && player.isPlaying) {
+        // Pressed play during the wait: their call, don't touch it again.
+        _readAlongGatePaused = false;
+      }
+      return;
+    }
+    _readAlongGateArmed = false;
+    if (_readAlongPrep != null && mounted) {
+      setState(() => _readAlongPrep = null);
+    }
+    if (_readAlongGatePaused) {
+      _readAlongGatePaused = false;
+      if (!player.isPlaying) {
+        debugPrint('[ReadAlong] runway ready, resuming');
+        await player.play(logDetail: 'read along ready', fromUi: true);
+      }
+    } else if (_readAlongGateWaiting) {
+      // The card leaving and the first sentence lighting up say it all.
+      _readAlongGateWaiting = false;
+    }
+    final pos = player.position.inMilliseconds / 1000.0;
+    // Same sync offset the player uses, so headphones don't run the reader's
+    // coloring ahead of the voice either.
+    final heard = pos - svc.offsetSeconds;
+    // The overlay shows a line a beat early because that reads like
+    // subtitles; on the page it cuts the last word of every sentence off. A
+    // small lead matched to the word timing, and almost no pre-show, so a
+    // sentence gets heard through before the next one takes over.
+    final line = TranscriptLineStore.instance.lineNear(
+        widget.itemId, heard + 0.15 * player.speed, preShow: 0.15);
+    // A seek re-anchors everything; without one, narration only moves
+    // forward, so an older line surfacing again (overlapping cached lines,
+    // a repeated phrase) must not drag the coloring back up the page.
+    final seeked = (pos - _readAlongLastPos).abs() > 3;
+    _readAlongLastPos = pos;
+    if (seeked) {
+      _readAlongAt = -1;
+      _readAlongLineStart = null;
+      _readAlongPageWords = 0;
+      _readAlongAllowBack = true;
+      _readAlongSeekAt = DateTime.now();
+      _readAlongLastMatch = DateTime.now();
+      _epubController?.webViewController
+          ?.evaluateJavascript(source: 'window.__absorbRA && __absorbRA.clear()')
+          .catchError((_) => null);
+      debugPrint('[ReadAlong] seek to ${pos.toStringAsFixed(1)}s, re-anchoring');
+    }
+    // A scrub is a run of seeks. Wait for the playhead to settle before
+    // relocating, so dragging the slider produces one relocate, not one per
+    // tick.
+    final seekAt = _readAlongSeekAt;
+    if (seekAt != null) {
+      if (DateTime.now().difference(seekAt) < const Duration(milliseconds: 1500)) {
+        return;
+      }
+      _readAlongSeekAt = null;
+    }
+    // Narration that doesn't match the page for a long stretch (an intro,
+    // an ad read, an abridged edition) leaves the last sentence lit forever
+    // otherwise. After 45s of playing with no match, say so and clear it;
+    // locating carries on, and the next hit clears the message.
+    final lastMatch = _readAlongLastMatch;
+    if (!_readAlongLost &&
+        !_readAlongBrowsing &&
+        lastMatch != null &&
+        player.isPlaying &&
+        DateTime.now().difference(lastMatch) > const Duration(seconds: 45)) {
+      _readAlongLost = true;
+      _readAlongLineStart = null;
+      _readAlongPageWords = 0;
+      _epubController?.webViewController
+          ?.evaluateJavascript(source: 'window.__absorbRA && __absorbRA.clear()')
+          .catchError((_) => null);
+      debugPrint('[ReadAlong] no match for 45s, marking lost');
+      if (mounted) setState(() {});
+    }
+    // Previews carry guessed timing for text the audio hasn't reached. The
+    // player overlay can dim them; a highlight in the book can't look
+    // tentative, and anchoring on one freezes the never-go-backwards guard
+    // when the real line lands - so read along waits for real coverage.
+    if (line == null || line.approx || line.text.trim().isEmpty) return;
+    if (!seeked &&
+        _readAlongLineStart != null &&
+        line.start < _readAlongLineStart!) {
+      debugPrint('[ReadAlong] skipped a line that goes backwards: '
+          '${line.start.toStringAsFixed(1)}s < '
+          '${_readAlongLineStart!.toStringAsFixed(1)}s');
+      return;
+    }
+    // A following line must not take over while the current sentence is
+    // still being heard - but "heard" means its last word has had its turn,
+    // not that the segment's trailing silence has run out, or every switch
+    // lands a beat late.
+    if (_readAlongLineStart != null &&
+        line.start != _readAlongLineStart &&
+        line.start > _readAlongLineStart! &&
+        heard < _readAlongLineLastWord) {
+      return;
+    }
+    if (line.start != _readAlongLineStart) {
+      if (_readAlongLocating) return;
+      _readAlongLineStart = line.start;
+      _readAlongLineLastWord = line.wordStarts.isNotEmpty
+          ? min(line.end, line.wordStarts.last + 0.35)
+          : line.end - 0.1;
+      _readAlongLineWords = line.words.length;
+      var needle = line.text.trim();
+      var needleExact = line.exact;
+      // A line cached before word timing existed can only be followed whole.
+      var wordMode = _readAlongWordMode && line.wordStarts.isNotEmpty;
+      // Whisper's own words are never on the page. Anchored, the previous
+      // sentence simply stays lit until a book line comes. With no anchor
+      // yet (just started, just seeked) that left the reader on the wrong
+      // page for as long as the stretch lasted, so find the next book line
+      // and go to where it is; the audio gets there in a moment.
+      if (!line.exact && _readAlongAt < 0 && _readAlongPageWords == 0) {
+        final nxt = TranscriptLineStore.instance
+            .nextExactLine(widget.itemId, line.end);
+        if (nxt != null) {
+          debugPrint('[ReadAlong] no anchor and this line is not the book\'s '
+              'words - locating the next book line instead');
+          needle = nxt.text.trim();
+          needleExact = true;
+          wordMode = false;
+        }
+      }
+      _readAlongLocating = true;
+      try {
+        await _paintReadAlongLine(needle,
+            exact: needleExact,
+            wordMode: wordMode,
+            lineStart: needleExact && needle == line.text.trim() ? line.start : null);
+      } finally {
+        _readAlongLocating = false;
+      }
+      return;
+    }
+    // Same sentence, later word: a cheap repaint from the cached offsets.
+    if (_readAlongLocating ||
+        _readAlongPageWords == 0 ||
+        !_readAlongWordMode) {
+      return;
+    }
+    final idx = line.wordIndexAt(heard + 0.15 * player.speed);
+    if (idx < 0) return;
+    // Whisper's word count and the page's can differ on a corrected line, so
+    // scale the index across instead of running off the end.
+    final scaled = _readAlongLineWords > 0
+        ? (idx * _readAlongPageWords / _readAlongLineWords).floor()
+        : idx;
+    var wordIndex = scaled.clamp(0, _readAlongPageWords - 1);
+    // Sweep rather than jump: at speed a tick can land several words on, and
+    // the short ones in between would never light up. One word per tick
+    // catches up within a few ticks; a bigger gap snaps.
+    if (_readAlongWordIndex >= 0 &&
+        wordIndex > _readAlongWordIndex + 1 &&
+        wordIndex - _readAlongWordIndex <= 4) {
+      wordIndex = _readAlongWordIndex + 1;
+    }
+    if (wordIndex == _readAlongWordIndex) return;
+    _readAlongWordIndex = wordIndex;
+    final raw = await _epubController?.webViewController?.evaluateJavascript(
+        source: 'window.__absorbRA ? __absorbRA.word($wordIndex) : ""');
+    if (!mounted || !_readAlongOn) return;
+    Map<String, dynamic>? d;
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        d = jsonDecode(raw) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    // The page turned into a different section and took the anchor with it:
+    // locate the sentence again on the next tick.
+    if (d == null || d['held'] != true) {
+      _readAlongLineStart = null;
+      _readAlongPageWords = 0;
+      _readAlongAt = -1;
+      return;
+    }
+    // The narration has run onto the next page mid-sentence. Turn there now
+    // rather than leaving you staring at a page the voice has left behind -
+    // and, coming the other way, without turning early and stranding the
+    // colouring off-screen until the sentence catches up.
+    _readAlongLastMatch = DateTime.now();
+    if (d['visible'] == false) {
+      final since = DateTime.now().difference(_readAlongOffPageLog);
+      if (since > const Duration(seconds: 2)) {
+        _readAlongOffPageLog = DateTime.now();
+        debugPrint('[ReadAlong] word $wordIndex off page: dir=${d['dir']} '
+            'x=${d['x']} of ${d['w']}');
+      }
+      _readAlongTurn(d['cfi'], d['dir'], why: 'word $wordIndex is off the page');
+    } else if (d['seen'] == true) {
+      _readAlongCaughtUp();
+    }
+  }
+
+  /// A page turn, jump or scroll the reader asked for. From here on the
+  /// place is the reader's own and gets saved.
+  void _userMoved(String how) {
+    _readingActiveAt = DateTime.now();
+    if (const {'chapter', 'highlight', 'bookmark', 'history'}.contains(how)) {
+      _rememberSpot(EbookSpotReason.beforeJump);
+    }
+    if (_holdOpenSpot) {
+      _holdOpenSpot = false;
+      debugPrint('[EbookReader] moved ($how) - saving the place from here item=${widget.itemId}');
+    }
+    _readAlongUserMoved(how);
+  }
+
+  void _readAlongUserMoved(String how) {
+    if (!_readAlongOn) return;
+    _readAlongBrowseAt = DateTime.now();
+    _readAlongSeenSince = null;
+    if (_readAlongBrowsing) return;
+    debugPrint('[ReadAlong] browsing ($how) - not following the narration');
+    if (mounted) setState(() => _readAlongBrowsing = true);
+  }
+
+  /// Following picks back up once the narration has stayed on screen for a
+  /// moment with the page at rest. Judged straight after a tap, the old page
+  /// is still showing and the turn would be pulled back.
+  void _readAlongCaughtUp() {
+    if (!_readAlongBrowsing) return;
+    final now = DateTime.now();
+    final seen = _readAlongSeenSince ??= now;
+    if (now.difference(_readAlongBrowseAt) < const Duration(seconds: 2) ||
+        now.difference(seen) < const Duration(seconds: 1)) {
+      return;
+    }
+    debugPrint('[ReadAlong] the narration is on this page - following again');
+    if (mounted) setState(() => _readAlongBrowsing = false);
+  }
+
+  /// Back from browsing: show the sentence being read now. Straight there
+  /// when it is still lit in a loaded section; otherwise the same way a seek
+  /// finds it again.
+  Future<void> _backToNarration() async {
+    if (!_readAlongOn) return;
+    setState(() {
+      _readAlongBrowsing = false;
+      _showControls = false;
+    });
+    if (_narrationReadAlong) {
+      _narrationWentTo = null;
+      await _narrationTick(force: true);
+      return;
+    }
+    _readAlongAllowBack = true;
+    _readAlongTurnPending = null;
+    _readAlongStepped = false;
+    _readAlongMissSince = null;
+    _readAlongLastMatch = DateTime.now();
+    final wc = _epubController?.webViewController;
+    final raw = await wc?.evaluateJavascript(
+        source: 'window.__absorbRA ? __absorbRA.curCfi() : ""');
+    if (!mounted || !_readAlongOn) return;
+    if (raw is String && raw.startsWith('epubcfi(')) {
+      debugPrint('[ReadAlong] back to narration: showing the lit sentence');
+      _readAlongLastTurn = DateTime.now();
+      _epubController?.display(cfi: raw);
+      return;
+    }
+    debugPrint('[ReadAlong] back to narration: finding the sentence again');
+    await wc?.evaluateJavascript(source: 'window.__absorbRA && __absorbRA.clear()');
+    _readAlongAt = -1;
+    _readAlongLineStart = null;
+    _readAlongPageWords = 0;
+    _readAlongLastScan = DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  /// Whether the section the narration was last found in ends on the page on
+  /// screen, so the next page starts the next section.
+  Future<bool> _readAlongSectionEndsHere() async {
+    final raw = await _epubController?.webViewController?.evaluateJavascript(
+        source: 'window.__absorbRA ? __absorbRA.atSectionEnd() : true');
+    return raw != false;
+  }
+
+  /// Every read-along page turn goes through here. Narration only moves
+  /// forward, so a turn backwards is refused unless a seek or a fresh start
+  /// re-anchored things - otherwise a sentence found earlier on the page and
+  /// a word on the next page take turns dragging the spread back and forth.
+  void _readAlongTurn(Object? cfi, Object? dir, {required String why}) {
+    if (dir is! num || dir == 0) return;
+    if (_readAlongBrowsing) {
+      _readAlongSeenSince = null;
+      return;
+    }
+    // A finger on a scrolling page is moving it; it is yours until you let go.
+    final down = _touchDownAt;
+    if (_scroll &&
+        down != null &&
+        DateTime.now().difference(down) < const Duration(seconds: 10)) {
+      return;
+    }
+    final back = dir < 0;
+    if (back && !_readAlongAllowBack) {
+      debugPrint('[ReadAlong] not turning back: $why');
+      return;
+    }
+    // One turn at a time: judging the next word before the last turn has
+    // landed reads it as still off the page and turns again, and the page
+    // ends up one ahead of the voice. The relocation callback clears this;
+    // a stuck one gives up after 3s.
+    final pending = _readAlongTurnPending;
+    if (pending != null &&
+        DateTime.now().difference(pending) < const Duration(seconds: 3)) {
+      return;
+    }
+    final since = DateTime.now().difference(_readAlongLastTurn);
+    if (since < const Duration(milliseconds: 700)) return;
+    _readAlongLastTurn = DateTime.now();
+    _readAlongTurnPending = DateTime.now();
+    // A forward turn that lands with the voice behind the page was our own
+    // overshoot; one turn back is allowed to correct it.
+    _readAlongAllowBack = !back;
+    // Step a page the way a tap does rather than jumping to a position: the
+    // position jump silently did nothing on some devices, and a target more
+    // than a page away simply takes another step on the next tick.
+    debugPrint('[ReadAlong] turning ${back ? 'back' : 'forward'}: $why');
+    unawaited(_turnPage(!back, fresh: true));
+  }
+
+  /// Find the line's text in the rendered pages and move the follow-coloring
+  /// there, page-turning when the line has moved past the visible page. A
+  /// line that isn't in the rendered sections (chapter boundary) is found via
+  /// the search book when its text is ebook-exact; Whisper-flavored lines
+  /// that don't match are skipped - the next exact line re-anchors.
+  /// [lineStart] is the audio time the sentence starts at, when the needle is
+  /// a book line heard at a known moment; every such hit is a sync point.
+  Future<void> _paintReadAlongLine(String needle,
+      {required bool exact, required bool wordMode, double? lineStart}) async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return;
+    final watch = Stopwatch()..start();
+    final res = await wc.callAsyncJavaScript(
+      functionBody: 'return window.__absorbRA ? '
+          '__absorbRA.locate(needle, wordMode, minOffset) : "";',
+      arguments: {
+        'needle': needle,
+        'wordMode': wordMode,
+        'minOffset': _readAlongAt,
+      },
+    );
+    final raw = res?.value;
+    if (!mounted || !_readAlongOn) return;
+    Map<String, dynamic>? d;
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        d = jsonDecode(raw) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    final head = needle.length > 50 ? '${needle.substring(0, 50)}...' : needle;
+    if (d != null && d['found'] == true) {
+      _readAlongMissSince = null;
+      _readAlongStepped = false;
+      _readAlongLastMatch = DateTime.now();
+      if (_readAlongLost) {
+        _readAlongLost = false;
+        if (mounted) setState(() {});
+      }
+      _readAlongPageWords = (d['words'] as num?)?.toInt() ?? 0;
+      _readAlongWordIndex = wordMode && _readAlongPageWords > 0 ? 0 : -1;
+      _readAlongAt = (d['at'] as num?)?.toInt() ?? -1;
+      // Logs the heard line against the page sentence it landed on, so a
+      // mis-mapping shows up as two different sentences on one line.
+      debugPrint('[ReadAlong] "$head" -> page@$_readAlongAt '
+          'words=$_readAlongPageWords visible=${d['visible']} '
+          '${watch.elapsedMilliseconds}ms | page: "${d['sentence']}"');
+      if (lineStart != null && d['si'] is num && _readAlongAt >= 0) {
+        unawaited(SyncPointStore.instance.add(
+          widget.itemId,
+          SyncPoint(
+            t: lineStart,
+            si: (d['si'] as num).toInt(),
+            off: _readAlongAt.toDouble(),
+            src: 'r',
+          ),
+          audioDuration: AudioPlayerService().currentItemId == widget.itemId
+              ? AudioPlayerService().displayDuration
+              : null,
+        ));
+      }
+      if (d['visible'] == false) {
+        _readAlongTurn(d['cfi'], d['dir'], why: 'sentence is off the page');
+      } else if (d['seen'] == true) {
+        _readAlongCaughtUp();
+      }
+      return;
+    }
+    debugPrint('[ReadAlong] "$head" not on the rendered pages '
+        '(${watch.elapsedMilliseconds}ms, exact=$exact)');
+    // Not in the rendered pages: an exact line can be found globally (chapter
+    // crossings land here); a whisper line just waits for the next one.
+    if (!exact) return;
+    // While you read elsewhere the narration moving into a section that isn't
+    // loaded is expected, and the step or scan below would move your page.
+    if (_readAlongBrowsing) return;
+    // That scan loads every section of the book, which takes seconds and
+    // stalls the page while it runs, and it lands on the section start, not
+    // the sentence. One miss is usually a sentence sitting off the current
+    // page or a page turn still rendering, so it only runs once a sentence
+    // has stayed missing for a couple of seconds, well clear of any turn.
+    final now = DateTime.now();
+    _readAlongMissSince ??= now;
+    // With no anchor at all (just started, just seeked) the audio can be
+    // anywhere in the book, and the delays below only left the reader on
+    // the wrong page while the book's lines went by. Scan straight away.
+    final unanchored = _readAlongAt < 0 && _readAlongPageWords == 0;
+    // Narration runs forward, and the next sentence not being in the rendered
+    // pages usually means it starts the next section - which is simply the
+    // next page. Step once and look again before paying for a scan.
+    // Only when the section really ends on this page, though: mid-section
+    // the miss is a sentence that didn't match the page text, and stepping
+    // turned the page away and straight back again on the next sentence.
+    if (!unanchored && !_readAlongStepped) {
+      _readAlongStepped = true;
+      if (await _readAlongSectionEndsHere()) {
+        if (!mounted || !_readAlongOn) return;
+        _readAlongTurn(null, 1, why: 'sentence is not on this page, trying the next');
+        return;
+      }
+      debugPrint('[ReadAlong] not turning: the section goes on past this page');
+    }
+    final missing = now.difference(_readAlongMissSince!);
+    final sinceTurn = now.difference(_readAlongLastTurn);
+    final since = now.difference(_readAlongLastScan);
+    if ((!unanchored &&
+            (missing < const Duration(seconds: 2) ||
+                sinceTurn < const Duration(seconds: 3))) ||
+        since < const Duration(seconds: 10)) {
+      debugPrint('[ReadAlong] holding the whole-book scan '
+          '(missing ${missing.inMilliseconds}ms, turn ${sinceTurn.inSeconds}s ago, '
+          'scan ${since.inSeconds}s ago)');
+      return;
+    }
+    _readAlongLastScan = now;
+    final hres = await wc.callAsyncJavaScript(functionBody: r'''
+      var sb = window.__absorbSearchBook;
+      if (!sb) {
+        sb = ePub();
+        sb.spine.unpack(book.packaging, book.resolve.bind(book), book.canonical.bind(book));
+        window.__absorbSearchBook = sb;
+      }
+      var q = needle.toLowerCase().replace(/\s+/g,' ').trim();
+      var sq = q.replace(/ /g, '');
+      var items = (sb.spine && sb.spine.spineItems) ? sb.spine.spineItems : [];
+      var found = '';
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i], text = '';
+        try {
+          await item.load(book.load.bind(book));
+          var d = item.document;
+          text = d ? ((d.body && d.body.textContent) || (d.documentElement && d.documentElement.textContent) || '') : '';
+        } catch(e){}
+        finally { try { item.unload(); } catch(e2){} }
+        await new Promise(function(r) { setTimeout(r, 0); });
+        if (!text) continue;
+        var low = text.toLowerCase();
+        if (low.replace(/\s+/g,' ').indexOf(q) !== -1 ||
+            (sq.length >= 8 && low.replace(/\s+/g,'').indexOf(sq) !== -1)) { found = item.href || ''; break; }
+      }
+      return JSON.stringify({href: found});
+    ''', arguments: {'needle': needle});
+    final hraw = hres?.value;
+    if (!mounted || !_readAlongOn || hraw is! String) return;
+    String href = '';
+    try {
+      href = (jsonDecode(hraw) as Map<String, dynamic>)['href'] as String? ?? '';
+    } catch (_) {}
+    if (href.isEmpty) return;
+    // Land on the sentence itself, the way Find in ebook does, and let the
+    // next tick paint it. Only if the sentence can't be pinned in the live
+    // section does it fall back to the section start, which then costs a
+    // page turn per page to reach the narration.
+    wc.evaluateJavascript(source: 'window.__absorbRA && __absorbRA.clear()');
+    _readAlongPageWords = 0;
+    _readAlongAt = -1;
+    _readAlongAllowBack = true;
+    _readAlongLastTurn = DateTime.now();
+    _readAlongMissSince = null;
+    _readAlongLineStart = null;
+    final landed = await _jumpToFindHit(href, needle, flash: false);
+    debugPrint('[ReadAlong] whole-book scan -> $href, on the sentence: $landed');
+    if (!landed && mounted && _readAlongOn) {
+      _readAlongLastTurn = DateTime.now();
+      _epubController?.display(cfi: href);
+    }
+  }
+
+  /// Brief highlight so the user can spot the passage on the page. Strong
+  /// opacity and a vivid amber so it stays visible across light, sepia, and
+  /// dark themes (the highlight blends with the page, so a faint tint washes
+  /// out on some).
+  void _flashHighlight(String cfi,
+      {Duration duration = const Duration(seconds: 4)}) {
+    _epubController?.addHighlight(
+      cfi: cfi,
+      color: const Color(0xFFFFC400),
+      opacity: 0.9,
+    );
+    Future.delayed(duration, () {
+      if (!mounted) return;
+      _epubController?.removeHighlight(cfi: cfi);
+    });
+  }
+
+  /// Reads epub.js's current location and pushes page/chapter/percent into
+  /// state, bypassing the relocated-event plumbing that a scripted jump can
+  /// leave stale. Waits out the display's settle first.
+  Future<void> _refreshLocationAfterJump() async {
+    final wc = _epubController?.webViewController;
+    if (wc == null) return;
+    final res = await wc.callAsyncJavaScript(functionBody: r'''
+      await new Promise(function(r){ setTimeout(r, 450); });
+      try { rendition.reportLocation(); } catch(e0){}
+      var out = {};
+      try {
+        var loc = rendition.currentLocation();
+        if (loc && loc.start) {
+          out.cfi = loc.start.cfi || null;
+          out.href = loc.start.href || '';
+          if (loc.start.displayed) {
+            out.page = loc.start.displayed.page;
+            out.total = loc.start.displayed.total;
+          }
+          var info = (typeof readerPageInfo === 'function') ? readerPageInfo() : null;
+          if (info) {
+            out.page = info.page;
+            out.total = info.total;
+            out.href = info.href || out.href;
+          }
+          out.percentage = (typeof loc.start.percentage === 'number') ? loc.start.percentage : null;
+          if ((out.percentage == null || out.percentage === 0) && book.locations && loc.start.cfi) {
+            try {
+              var nLoc = (typeof book.locations.length === 'function')
+                  ? book.locations.length() : book.locations.length;
+              if (nLoc) out.percentage = book.locations.percentageFromCfi(loc.start.cfi);
+            } catch(e1){}
+          }
+        }
+      } catch(e){ out.err = String(e); }
+      return JSON.stringify(out);
+    ''');
+    final raw = res?.value;
+    debugPrint('[Search] refreshLocation $raw');
+    if (!mounted || raw is! String || raw.isEmpty) return;
+    Map<String, dynamic> d;
+    try {
+      d = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+    final cfi = d['cfi'] as String?;
+    final href = d['href'] as String? ?? '';
+    final page = (d['page'] as num?)?.toInt();
+    final total = (d['total'] as num?)?.toInt();
+    final pct = (d['percentage'] as num?)?.toDouble();
+    setState(() {
+      if (page != null && total != null && total > 0) {
+        _chapterPage = page;
+        _chapterPageTotal = total;
+      }
+      if (href.isNotEmpty) {
+        _currentChapterTitle = _chapterForHref(href) ?? _currentChapterTitle;
+      }
+      if (pct != null && pct > 0 && _locationsReady) {
+        _progress = pct.clamp(0.0, 1.0);
+      }
+    });
+    if (cfi != null && cfi.isNotEmpty) {
+      _currentCfi = cfi;
+      _updateBookmarkState();
+      _syncProgress(cfi, _progress);
+    }
+  }
+
+  Future<void> _openSearchScreen() async {
+    // Fullscreen route — opaque so the WebView is fully covered. Bottom-sheet
+    // approach had soft-keyboard taps leaking through to the reader's JS
+    // swipe-to-turn handlers underneath.
+    final selected = await Navigator.of(context, rootNavigator: true).push<EpubSearchResult>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => _EbookSearchScreen(
+          initialQuery: _searchQuery,
+          initialResults: _searchResults,
+          initialChapters: _resultChapters,
+          initialLastQuery: _lastSearchedQuery,
+          runSearch: (q) async {
+            final payload = await _searchBook(q);
+            // Persist back on the parent state so reopening the search screen
+            // restores the same list.
+            if (mounted) {
+              setState(() {
+                _searchQuery = q;
+                _searchResults = payload.results;
+                _resultChapters = payload.chapters;
+                _lastSearchedQuery = q;
+              });
+            }
+            return payload;
+          },
+        ),
+      ),
+    );
+    if (selected != null && mounted) {
+      _jumpToSearchResult(selected);
+    }
+  }
+
+  void _rememberSpot(EbookSpotReason reason) {
+    final cfi = _currentCfi;
+    if (cfi == null || cfi.isEmpty) return;
+    unawaited(EbookHistory.instance.record(widget.itemId,
+        cfi: cfi, reason: reason, progress: _progress, chapter: _currentChapterTitle));
+  }
+
+  Widget _historyTab(BuildContext ctx, ScrollController scrollController) {
+    final l = AppLocalizations.of(ctx)!;
+    final cs = Theme.of(ctx).colorScheme;
+    return FutureBuilder<List<EbookSpot>>(
+      future: EbookHistory.instance.spots(widget.itemId),
+      builder: (ctx, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator(strokeWidth: 2));
+        }
+        final spots = snap.data ?? const <EbookSpot>[];
+        if (spots.isEmpty) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(l.readerHistoryEmpty,
+                  textAlign: TextAlign.center, style: TextStyle(color: cs.onSurfaceVariant)),
+            ),
+          );
+        }
+        return ListView.builder(
+          controller: scrollController,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          itemCount: spots.length,
+          itemBuilder: (ctx, i) {
+            final s = spots[i];
+            final pct = s.progress == null ? null : '${(s.progress! * 100).round()}%';
+            final why = switch (s.reason) {
+              EbookSpotReason.closed => l.readerHistoryClosed,
+              EbookSpotReason.beforeJump => l.readerHistoryBeforeJump,
+              EbookSpotReason.beforeSync => l.readerHistoryBeforeSync,
+            };
+            return ListTile(
+              dense: true,
+              leading: Icon(
+                switch (s.reason) {
+                  EbookSpotReason.closed => Icons.menu_book_rounded,
+                  EbookSpotReason.beforeJump => Icons.undo_rounded,
+                  EbookSpotReason.beforeSync => Icons.headphones_rounded,
+                },
+                color: cs.onSurfaceVariant,
+              ),
+              title: Text(s.chapter ?? pct ?? '', maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text('$why · ${dateLabel(s.at, l)} ${timeOfDay(s.at, l)}',
+                  style: TextStyle(color: cs.onSurfaceVariant)),
+              trailing: s.chapter != null && pct != null
+                  ? Text(pct, style: TextStyle(color: cs.onSurfaceVariant))
+                  : null,
+              onTap: () {
+                Navigator.pop(ctx);
+                _userMoved('history');
+                _epubController?.display(cfi: s.cfi);
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _setLogReading(bool on) async {
+    debugPrint('[ReadingTime] ${widget.itemId}: counting reading time ${on ? 'on' : 'off'}');
+    setState(() => _logReading = on);
+    await ScopedPrefs.setBool(_kLogReading, on);
+    if (on) {
+      _readingActiveAt = DateTime.now();
+      _startReadingClock();
+    } else {
+      _readingTimer?.cancel();
+      _readingTimer = null;
+      await _sendReadingTime(closing: true);
+    }
+  }
+
+  void _startReadingClock() {
+    _readingTimer ??= Timer.periodic(const Duration(seconds: 15), (_) => _readingTick());
+  }
+
+  void _readingTick() {
+    if (!_logReading || !_readerActive) return;
+    // This book's audio playing at either end of the tick means the time
+    // is listening (read along included), counted by that session alone.
+    final player = AudioPlayerService();
+    final listening = player.isPlaying && player.currentItemId == widget.itemId;
+    final listened = _readingAudioWasOn;
+    _readingAudioWasOn = listening;
+    if (listening || listened) return;
+    if (!_autoScroll && DateTime.now().difference(_readingActiveAt) > const Duration(minutes: 5)) return;
+    _readingSessionId ??= LocalSessionService().newSessionId();
+    _readingStartedAt ??= DateTime.now().subtract(const Duration(seconds: 15));
+    _readingStartPct ??= _progress;
+    _readingSeconds += 15;
+    if (_readingSeconds - _readingSent >= 60) unawaited(_sendReadingTime());
+  }
+
+  /// Sends the reading time so far. A new day starts a new session, as
+  /// listening does.
+  Future<void> _sendReadingTime({bool closing = false}) async {
+    final id = _readingSessionId, started = _readingStartedAt, api = _readingApi;
+    if (id == null || started == null || api == null) return;
+    final seconds = _readingSeconds;
+    if (seconds <= _readingSent && !closing) return;
+    final local = await ProgressSyncService().getLocal(widget.itemId);
+    final audioAt = (local?['currentTime'] as num?)?.toDouble() ?? 0;
+    var ok = false;
+    if (seconds >= 10) {
+      ok = await api.logReadingTime(widget.itemId,
+          sessionId: id,
+          startedAt: started,
+          seconds: seconds,
+          audioAt: audioAt,
+          audioDuration: _audioTotal,
+          title: widget.title,
+          ebookStart: _readingStartPct,
+          ebookEnd: _progress);
+      if (ok) _readingSent = seconds;
+      debugPrint('[ReadingTime] ${widget.itemId}: ${seconds}s ${ok ? 'logged' : 'not sent'}');
+      if (!ok && closing && !api.isBookOrbit) {
+        await LocalSessionService().queue(ApiService.readingSession(widget.itemId,
+            sessionId: id,
+            startedAt: started,
+            seconds: seconds,
+            audioAt: audioAt,
+            audioDuration: _audioTotal,
+            title: widget.title));
+      }
+    }
+    if (closing || DateUtils.dateOnly(started) != DateUtils.dateOnly(DateTime.now())) {
+      debugPrint('[ReadingTime] ${widget.itemId}: session $id ended at ${seconds}s');
+      _readingSessionId = null;
+      _readingStartedAt = null;
+      _readingStartPct = null;
+      _readingSeconds = 0;
+      _readingSent = 0;
+    }
+  }
+
+  void _showAnnotationsSheet() {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final highlights = _annotations.where((a) => a.type == AnnotationType.highlight).toList();
+    final bookmarks = _annotations.where((a) => a.type == AnnotationType.bookmark).toList();
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cs.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        maxChildSize: 0.9,
+        minChildSize: 0.3,
+        builder: (ctx, scrollController) => DefaultTabController(
+          length: 3,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: Row(
+                  children: [
+                    Text(AppLocalizations.of(ctx)!.readerAnnotations, style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+                    const Spacer(),
+                    Text(
+                      '${_annotations.length}',
+                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+              TabBar(
+                tabs: [
+                  Tab(text: AppLocalizations.of(ctx)!.readerHighlights(highlights.length)),
+                  Tab(text: AppLocalizations.of(ctx)!.readerBookmarks(bookmarks.length)),
+                  Tab(text: AppLocalizations.of(ctx)!.readerHistory),
+                ],
+                labelColor: cs.primary,
+                unselectedLabelColor: cs.onSurfaceVariant,
+                indicatorColor: cs.primary,
+              ),
+              Expanded(
+                child: TabBarView(
+                  children: [
+                    // Highlights tab
+                    highlights.isEmpty
+                        ? Center(child: Text(AppLocalizations.of(ctx)!.readerNoHighlights, style: TextStyle(color: cs.onSurfaceVariant)))
+                        : ListView.builder(
+                            controller: scrollController,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            itemCount: highlights.length,
+                            itemBuilder: (ctx, i) {
+                              final h = highlights[i];
+                              return Dismissible(
+                                key: ValueKey(h.id),
+                                direction: DismissDirection.endToStart,
+                                background: Container(
+                                  alignment: Alignment.centerRight,
+                                  padding: const EdgeInsets.only(right: 16),
+                                  color: cs.error,
+                                  child: Icon(Icons.delete_rounded, color: cs.onError),
+                                ),
+                                onDismissed: (_) => _removeHighlight(h),
+                                child: ListTile(
+                                  leading: Container(
+                                    width: 4,
+                                    height: 40,
+                                    decoration: BoxDecoration(
+                                      color: Color(int.parse('FF${h.color!.hex.substring(1)}', radix: 16)),
+                                      borderRadius: BorderRadius.circular(2),
+                                    ),
+                                  ),
+                                  title: Text(
+                                    h.selectedText ?? '',
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: tt.bodyMedium,
+                                  ),
+                                  subtitle: h.note != null && h.note!.isNotEmpty
+                                      ? Text(h.note!, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                          style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant))
+                                      : null,
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.ios_share_rounded, size: 18),
+                                    tooltip: AppLocalizations.of(ctx)!.quoteShareTitle,
+                                    color: cs.onSurfaceVariant,
+                                    onPressed: () {
+                                      Navigator.pop(ctx);
+                                      _shareHighlight(h);
+                                    },
+                                  ),
+                                  dense: true,
+                                  onTap: () {
+                                    Navigator.pop(ctx);
+                                    _userMoved('highlight');
+                                    _epubController?.display(cfi: pointCfi(h.cfi));
+                                  },
+                                  onLongPress: () => _addNoteToAnnotation(h),
+                                ),
+                              );
+                            },
+                          ),
+
+                    // Bookmarks tab
+                    bookmarks.isEmpty
+                        ? Center(child: Text(AppLocalizations.of(ctx)!.readerNoBookmarks, style: TextStyle(color: cs.onSurfaceVariant)))
+                        : ListView.builder(
+                            controller: scrollController,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            itemCount: bookmarks.length,
+                            itemBuilder: (ctx, i) {
+                              final bm = bookmarks[i];
+                              final date = '${bm.createdAt.month}/${bm.createdAt.day}/${bm.createdAt.year}';
+                              return Dismissible(
+                                key: ValueKey(bm.id),
+                                direction: DismissDirection.endToStart,
+                                background: Container(
+                                  alignment: Alignment.centerRight,
+                                  padding: const EdgeInsets.only(right: 16),
+                                  color: cs.error,
+                                  child: Icon(Icons.delete_rounded, color: cs.onError),
+                                ),
+                                onDismissed: (_) async {
+                                  await _annotationService.delete(
+                                    itemId: widget.itemId,
+                                    annotationId: bm.id,
+                                  );
+                                  _annotations.removeWhere((a) => a.id == bm.id);
+                                  _updateBookmarkState();
+                                  if (mounted) setState(() {});
+                                },
+                                child: ListTile(
+                                  leading: Icon(Icons.bookmark_rounded, color: cs.primary),
+                                  title: Text(
+                                    bm.note ?? AppLocalizations.of(ctx)!.readerBookmarkDefault,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: tt.bodyMedium,
+                                  ),
+                                  subtitle: Text(date, style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                                  dense: true,
+                                  onTap: () {
+                                    Navigator.pop(ctx);
+                                    _userMoved('bookmark');
+                                    _epubController?.display(cfi: pointCfi(bm.cfi));
+                                  },
+                                  onLongPress: () => _addNoteToAnnotation(bm),
+                                ),
+                              );
+                            },
+                          ),
+                    _historyTab(ctx, scrollController),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Wraps a body in a Scaffold.
+  Widget _wrap(Widget body, Color bg, {PreferredSizeWidget? appBar}) {
+    // Don't resize for the keyboard — epub.js reflows when the WebView
+    // resizes, which would shift the visible page when the search keyboard
+    // pops up. The bottom sheet positions itself above the keyboard via
+    // MediaQuery.viewInsets, so it stays visible regardless.
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: appBar,
+      body: body,
+      resizeToAvoidBottomInset: false,
+    );
+  }
+
+  // The viewer's safe-area padding, frozen at the smallest value seen for the
+  // current window size. Swiping to recents un-hides the system bars, which
+  // grows MediaQuery padding for a moment - a live SafeArea would shrink the
+  // WebView and epub.js would visibly rescale the page mid-gesture. Once
+  // immersive mode settles, the only real padding left is the camera cutout,
+  // which only changes when the window size does (rotation, split-screen), so
+  // padding growth at a constant size is transient chrome and is ignored.
+  EdgeInsets? _viewerPadding;
+  Size? _viewerPaddingSize;
+
+  Widget _buildTopBarContent(Color fg, Color fgDim, Color accent) {
+    final bookProgress = _progress.clamp(0.0, 1.0);
+    final chapterProgress = _chapterPageTotal > 0
+        ? (_chapterPage / _chapterPageTotal).clamp(0.0, 1.0)
+        : 0.0;
+    final both = _topBarProgress == 'both';
+    final chapterOnly = _topBarProgress == 'chapter';
+    Widget bar(double value, double height) => ClipRRect(
+          borderRadius: BorderRadius.circular(2),
+          child: LinearProgressIndicator(
+            value: value,
+            minHeight: height,
+            backgroundColor: fg.withValues(alpha: 0.1),
+            valueColor: AlwaysStoppedAnimation(accent),
+          ),
+        );
+    final percent = chapterOnly
+        ? (_chapterPageTotal > 0 ? '${(chapterProgress * 100).round()}%' : '')
+        : '${(bookProgress * 100).toStringAsFixed(1)}%';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              SizedBox(
+                width: 40,
+                height: 36,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: 22,
+                  tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+                  icon: Icon(Icons.arrow_back_rounded, color: fg),
+                  onPressed: _handleClose,
+                ),
+              ),
+              Expanded(
+                child: Text(
+                  widget.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: fg,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 40,
+                height: 36,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: 22,
+                  tooltip: AppLocalizations.of(context)!.readerTooltipSearch,
+                  icon: Icon(Icons.search_rounded, color: fg),
+                  onPressed: _openSearchScreen,
+                ),
+              ),
+            ],
+          ),
+          // Both bars fit in the height one bar takes, so a pinned page
+          // doesn't change size and re-paginate when this is switched.
+          SizedBox(height: both ? 2 : 6),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Column(
+              children: [
+                if (both) ...[
+                  bar(chapterProgress, 3),
+                  const SizedBox(height: 2),
+                  bar(bookProgress, 2),
+                ] else
+                  bar(chapterOnly ? chapterProgress : bookProgress, 3),
+                const SizedBox(height: 4),
+                _topBarDetails(fgDim, percent),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _topBarDetails(Color fgDim, String percent) {
+    return Row(
+            children: [
+              if (_chapterPageTotal > 0)
+                Text(
+                  '$_chapterPage / $_chapterPageTotal',
+                  style: TextStyle(color: fgDim, fontSize: 11),
+                ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Text(
+                    _currentChapterTitle ?? '',
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: fgDim, fontSize: 11),
+                  ),
+                ),
+              ),
+              Text(
+                percent,
+                style: TextStyle(color: fgDim, fontSize: 11),
+              ),
+            ],
+          );
+  }
+
+  /// The page on its own, or under the always-visible bar when pinned. The
+  /// bar takes the frozen cutout padding (not a live SafeArea) so the system
+  /// bars flashing in during a recents swipe can't resize the WebView.
+  Widget _withPinnedTopBar(
+      Color bg, Color fg, Color fgDim, Color accent, Widget viewerArea) {
+    // Same column in both modes, with an empty slot when the bar is off. If
+    // the tree around the viewer changed shape, Flutter would recreate the
+    // WebView and the book would reopen at the start with its handlers gone.
+    final frozen = _frozenViewerPadding();
+    return Column(
+      children: [
+        if (_pinTop)
+          Container(
+            color: bg,
+            padding: EdgeInsets.only(
+                top: frozen.top, left: frozen.left, right: frozen.right),
+            child: _buildTopBarContent(fg, fgDim, accent),
+          )
+        else
+          const SizedBox.shrink(),
+        Expanded(child: viewerArea),
+      ],
+    );
+  }
+
+  /// Padded with the frozen safe-area padding above so the page never slides
+  /// under the camera cutout but also never resizes when the system bars flash
+  /// back in. Side margins are applied here (horizontal padding shrinks the
+  /// WebView so epub.js paginates into the narrower box) - epub.js's column
+  /// layout ignores horizontal body padding, so CSS only handles the vertical
+  /// margins.
+  EdgeInsets _frozenViewerPadding() {
+    final size = MediaQuery.sizeOf(context);
+    final pad = MediaQuery.paddingOf(context);
+    final prev = _viewerPadding;
+    if (prev == null || _viewerPaddingSize != size) {
+      _viewerPadding = pad;
+      _viewerPaddingSize = size;
+    } else {
+      _viewerPadding = EdgeInsets.only(
+        left: min(prev.left, pad.left),
+        top: min(prev.top, pad.top),
+        right: min(prev.right, pad.right),
+        bottom: min(prev.bottom, pad.bottom),
+      );
+    }
+    return _viewerPadding!;
+  }
+
+  Widget _buildViewerArea(Widget viewer) {
+    final frozen = _frozenViewerPadding();
+    // With the bar pinned above the page, the bar already clears the cutout.
+    final padding = _pinTop ? frozen.copyWith(top: 0) : frozen;
+    // The curl covers the whole page, margins too; the picture sits where
+    // the web view does.
+    _curlInset = padding + EdgeInsets.symmetric(horizontal: _marginH.toDouble());
+    return Stack(
+      children: [
+        Padding(
+          padding: padding,
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: _marginH.toDouble()),
+            child: LayoutBuilder(
+              builder: (ctx, cons) => Listener(
+                behavior: HitTestBehavior.translucent,
+                onPointerDown: (e) {
+                  _ptrDownX = e.localPosition.dx;
+                  _ptrDownY = e.localPosition.dy;
+                  _curlDragDown(e);
+                },
+                onPointerMove: _curlDragMove,
+                onPointerCancel: (e) => _curlDragUp(e, cancelled: true),
+                onPointerUp: (e) {
+                  final w = cons.maxWidth;
+                  final dx = _ptrDownX != null ? (e.localPosition.dx - _ptrDownX!).abs() : 0.0;
+                  final dy = _ptrDownY != null ? (e.localPosition.dy - _ptrDownY!).abs() : 0.0;
+                  _ptrDownX = null;
+                  _ptrDownY = null;
+                  if (_curlDragUp(e)) return;
+                  if (dx > 16 || dy > 16 || w <= 0) return;
+                  final h = cons.maxHeight;
+                  _readerTapAt(e.localPosition.dx / w, h > 0 ? e.localPosition.dy / h : 0.5, 'flutterPtr');
+                },
+                child: SizedBox.expand(child: viewer),
+              ),
+            ),
+          ),
+        ),
+        Positioned.fill(
+          child: PageCurlLayer(
+            controller: _curl,
+            pageColor: _resolvePalette(context).bgColor,
+            style: kDrawnTurnStyles.contains(_turnNow) ? _turnNow : 'curl',
+            inset: _curlInset,
+          ),
+        ),
+        if (_editingTapZones)
+          Positioned.fill(
+            child: Padding(
+              padding: _curlInset,
+              child: TapZonesEditor(
+                zones: _tapZones,
+                onChanged: (z) {
+                  setState(() => _tapZones = z);
+                  unawaited(z.save());
+                },
+                onDone: () => setState(() => _editingTapZones = false),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _handleClose() {
+    unawaited(_narrationCarryReadingSpot());
+    Navigator.pop(context);
+  }
+
+  String _speedLabel(double s) {
+    var t = s.toStringAsFixed(2);
+    if (t.contains('.')) t = t.replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+    return '${t}x';
+  }
+
+  /// Press-and-hold on the auto scroll button: stop the blind after a while
+  /// and let the screen go dark, for reading yourself to sleep. Picking a
+  /// time starts auto scroll if it isn't running.
+  Future<void> _showAutoScrollSleepSheet() async {
+    final l = AppLocalizations.of(context)!;
+    Timer? ticker;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        final tt = Theme.of(ctx).textTheme;
+        return StatefulBuilder(builder: (ctx, setSheet) {
+          // The minutes-left line keeps up while the sheet is open.
+          ticker ??= Timer.periodic(const Duration(seconds: 20), (t) {
+            if (ctx.mounted) {
+              setSheet(() {});
+            } else {
+              t.cancel();
+            }
+          });
+          final end = _autoScrollSleepEnd;
+          final left = end == null
+              ? null
+              : (end.difference(DateTime.now()).inSeconds / 60).ceil().clamp(1, 999);
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(l.readerAutoScrollSleep,
+                      style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text(
+                    left != null
+                        ? l.readerAutoScrollSleepLeft(left)
+                        : l.readerAutoScrollSleepHint,
+                    style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    for (final m in const [10, 15, 20, 30, 45, 60])
+                      ChoiceChip(
+                        label: Text(l.readerAutoScrollSleepMinutes(m)),
+                        selected: end != null && _autoScrollSleepMinutes == m,
+                        onSelected: (_) {
+                          Navigator.pop(ctx);
+                          _armAutoScrollSleep(m);
+                        },
+                      ),
+                    if (end != null)
+                      ActionChip(
+                        label: Text(l.off),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _cancelAutoScrollSleep(toast: true);
+                        },
+                      ),
+                  ]),
+                ],
+              ),
+            ),
+          );
+        });
+      },
+    ).whenComplete(() => ticker?.cancel());
+  }
+
+  Future<void> _armAutoScrollSleep(int minutes) async {
+    await PlayerSettings.setEreaderAutoScrollSleepMinutes(minutes);
+    if (!mounted) return;
+    if (!_autoScroll) {
+      await _toggleAutoScroll();
+      if (!mounted || !_autoScroll) return;
+    }
+    _autoScrollSleepTimer?.cancel();
+    _autoScrollSleepMinutes = minutes;
+    _autoScrollSleepEnd = DateTime.now().add(Duration(minutes: minutes));
+    _autoScrollSleepTimer =
+        Timer(Duration(minutes: minutes), _onAutoScrollSleepFired);
+    debugPrint('[AutoScroll] sleep timer armed for ${minutes}m');
+    showOverlayToast(context, AppLocalizations.of(context)!.readerAutoScrollSleepIn(minutes),
+        icon: Icons.nightlight_round_outlined);
+  }
+
+  void _cancelAutoScrollSleep({bool toast = false}) {
+    if (_autoScrollSleepTimer == null) return;
+    _autoScrollSleepTimer?.cancel();
+    _autoScrollSleepTimer = null;
+    _autoScrollSleepEnd = null;
+    _autoScrollSleepMinutes = 0;
+    debugPrint('[AutoScroll] sleep timer cancelled');
+    if (toast && mounted) {
+      showOverlayToast(context, AppLocalizations.of(context)!.readerAutoScrollSleepOff,
+          icon: Icons.nightlight_round_outlined);
+    }
+  }
+
+  Future<void> _onAutoScrollSleepFired() async {
+    _autoScrollSleepTimer = null;
+    _autoScrollSleepEnd = null;
+    _autoScrollSleepMinutes = 0;
+    if (!mounted) return;
+    debugPrint('[AutoScroll] sleep timer fired - stopping the blind and '
+        'letting the screen sleep');
+    _speedToast?.dismiss();
+    _speedToast = null;
+    if (_autoScroll) await _toggleAutoScroll();
+    if (!mounted) return;
+    _screenWakeHeldOff = true;
+    _syncScreenWake();
+    showOverlayToast(context, AppLocalizations.of(context)!.readerAutoScrollSleepEnded,
+        icon: Icons.nightlight_round_outlined);
+  }
+
+  /// The up arrow on the media bar: the audiobook card's controls that make
+  /// sense with the book open, on the app surface like the speed sheet.
+  void _showReaderControls() {
+    final accent = Theme.of(context).colorScheme.primary;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      useSafeArea: true,
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        return Container(
+          decoration: BoxDecoration(
+            color: Theme.of(ctx).bottomSheetTheme.backgroundColor,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+            border: Border(
+                top: BorderSide(color: accent.withValues(alpha: 0.2), width: 1)),
+          ),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: cs.onSurface.withValues(alpha: 0.24),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                LayoutBuilder(builder: (_, constraints) {
+                  const gap = 10.0;
+                  final textScale = MediaQuery.textScalerOf(ctx).scale(1.0);
+                  final cols =
+                      (constraints.maxWidth < 340 || textScale >= 1.3) ? 2 : 3;
+                  final cellW = (constraints.maxWidth - gap * (cols - 1)) / cols;
+                  final cellH =
+                      (cols == 2 ? 72.0 : 80.0) * textScale.clamp(1.0, 1.7) + 8;
+                  return Wrap(spacing: gap, runSpacing: gap, children: [
+                    for (final tile in _readerControlTiles(ctx, accent))
+                      SizedBox(width: cellW, height: cellH, child: tile),
+                  ]);
+                }),
+                const SizedBox(height: 4),
+                TextButton.icon(
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _pickBarAction();
+                  },
+                  icon: const Icon(Icons.swap_horiz_rounded, size: 18),
+                  label: Text(AppLocalizations.of(ctx)!.readerShortcutButton),
+                ),
+              ]),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  List<Widget> _readerControlTiles(BuildContext ctx, Color accent) {
+    Widget tile(String id) {
+      Widget build() {
+        final a = _readerAction(id);
+        return MoreMenuItem(
+          icon: a.icon,
+          label: a.label,
+          accent: a.tint ?? accent,
+          enabled: a.enabled,
+          onTap: () {
+            Navigator.pop(ctx);
+            a.onTap();
+          },
+        );
+      }
+
+      final listenable = _readerActionListenable(id);
+      return listenable == null
+          ? build()
+          : ListenableBuilder(listenable: listenable, builder: (_, __) => build());
+    }
+
+    return [
+      for (final id in _readerActionIds)
+        if (id != _barActionId) tile(id),
+    ];
+  }
+
+  // Cast is Android only; iPhones get the AirPlay route picker instead, same
+  // split as the card.
+  List<String> get _readerActionIds => [
+        'chapters',
+        'speed',
+        'sleep',
+        'bookmarks',
+        'equalizer',
+        Platform.isIOS ? 'airplay' : 'cast',
+        'details',
+        'download',
+      ];
+
+  // A choice restored from the other platform may not exist on this one.
+  String get _barActionId =>
+      _readerActionIds.contains(_barAction) ? _barAction : 'speed';
+
+  Listenable? _readerActionListenable(String id) => switch (id) {
+        'cast' => ChromecastService(),
+        'download' => DownloadService(),
+        _ => null,
+      };
+
+  /// One of the reader's audio controls as it stands right now, for a tile in
+  /// the controls sheet or the player bar's shortcut.
+  _ReaderAction _readerAction(String id) {
+    final l = AppLocalizations.of(context)!;
+    final accent = Theme.of(context).colorScheme.primary;
+    final player = AudioPlayerService();
+    switch (id) {
+      case 'chapters':
+        return (
+          icon: Icons.list_rounded,
+          label: l.chapters,
+          tint: null,
+          enabled: true,
+          onTap: () => _showAudioChapters(accent, Theme.of(context).textTheme),
+        );
+      case 'speed':
+        return (
+          icon: Icons.speed_rounded,
+          label: l.speed,
+          tint: null,
+          enabled: true,
+          onTap: () => showModalBottomSheet(
+                context: context,
+                backgroundColor: Theme.of(context).colorScheme.surface,
+                shape: const RoundedRectangleBorder(
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+                ),
+                // The sheet sits on the app surface, not the page, so it
+                // keeps the theme accent.
+                builder: (_) => CardSpeedSheet(
+                  player: player,
+                  accent: accent,
+                  itemId: widget.itemId,
+                ),
+              ),
+        );
+      case 'sleep':
+        return (
+          icon: Icons.nightlight_round_outlined,
+          label: l.timer,
+          tint: null,
+          enabled: true,
+          onTap: () => showSleepTimerSheet(context, accent),
+        );
+      case 'bookmarks':
+        return (
+          icon: Icons.bookmark_outline_rounded,
+          label: l.bookmarks,
+          tint: null,
+          enabled: player.hasBook && player.currentItemId == widget.itemId,
+          onTap: () => showModalBottomSheet(
+                context: context,
+                backgroundColor: Colors.transparent,
+                isScrollControlled: true,
+                useSafeArea: true,
+                builder: (_) => DraggableScrollableSheet(
+                  initialChildSize: 0.6,
+                  minChildSize: 0.05,
+                  snap: true,
+                  maxChildSize: 0.9,
+                  expand: false,
+                  builder: (_, sc) => SimpleBookmarkSheet(
+                    itemId: widget.itemId,
+                    player: player,
+                    accent: accent,
+                    scrollController: sc,
+                    onChanged: () {},
+                  ),
+                ),
+              ),
+        );
+      case 'equalizer':
+        return (
+          icon: Icons.equalizer_rounded,
+          label: l.equalizerLabel,
+          tint: null,
+          enabled: true,
+          onTap: () => showEqualizerSheet(context, accent,
+              itemId: widget.itemId, itemTitle: widget.title),
+        );
+      case 'airplay':
+        return (
+          icon: Icons.airplay_rounded,
+          label: 'AirPlay',
+          tint: null,
+          enabled: true,
+          onTap: () => const MethodChannel('com.absorb.audio_output')
+              .invokeMethod('showRoutePicker')
+              .catchError((_) => null),
+        );
+      case 'cast':
+        final cast = ChromecastService();
+        final String label;
+        if (cast.isCasting && cast.castingItemId == widget.itemId) {
+          label = l.castingToDevice(cast.connectedDeviceName ?? 'device');
+        } else if (cast.isConnected) {
+          label = l.castToDeviceNamed(cast.connectedDeviceName ?? 'device');
+        } else {
+          label = l.castToDevice;
+        }
+        return (
+          icon: cast.isConnected
+              ? Icons.cast_connected_rounded
+              : Icons.cast_rounded,
+          label: label,
+          tint: null,
+          enabled: true,
+          onTap: _castFromReader,
+        );
+      case 'details':
+        return (
+          icon: Icons.info_outline_rounded,
+          label: l.bookDetailsLabel,
+          tint: null,
+          enabled: true,
+          onTap: () => showBookDetailSheet(context, widget.itemId),
+        );
+      default:
+        final dl = DownloadService();
+        final downloaded = dl.isDownloaded(widget.itemId);
+        final downloading = dl.isDownloading(widget.itemId);
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        return (
+          icon: downloaded
+              ? Icons.download_done_rounded
+              : downloading
+                  ? Icons.downloading_rounded
+                  : Icons.download_outlined,
+          label: downloaded
+              ? l.saved
+              : downloading
+                  ? '${(dl.downloadProgress(widget.itemId) * 100).toStringAsFixed(0)}%'
+                  : l.download,
+          tint: !downloaded
+              ? null
+              : isDark
+                  ? Colors.greenAccent.withValues(alpha: 0.7)
+                  : Colors.green.shade700,
+          enabled: true,
+          onTap: () {
+            if (!downloaded && !downloading) _downloadFromReader();
+          },
+        );
+    }
+  }
+
+  /// The player bar's left slot. Long press swaps what sits there.
+  Widget _barShortcut(Color fg, Color dim) {
+    final id = _barActionId;
+    Widget build() {
+      final a = _readerAction(id);
+      return GestureDetector(
+        onLongPress: _pickBarAction,
+        child: id == 'speed'
+            ? TextButton(
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: const Size(0, 36),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: a.onTap,
+                child: Text(_speedLabel(AudioPlayerService().speed),
+                    style: TextStyle(color: fg, fontWeight: FontWeight.w700)),
+              )
+            : IconButton(
+                icon: Icon(a.icon, color: a.enabled ? fg : dim),
+                iconSize: 26,
+                onPressed:
+                    a.enabled ? a.onTap : () => showInactiveToast(context),
+              ),
+      );
+    }
+
+    final listenable = _readerActionListenable(id);
+    return listenable == null
+        ? build()
+        : ListenableBuilder(listenable: listenable, builder: (_, __) => build());
+  }
+
+  Future<void> _pickBarAction() async {
+    final l = AppLocalizations.of(context)!;
+    final current = _barActionId;
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(l.readerShortcutButton,
+                      style: Theme.of(ctx)
+                          .textTheme
+                          .titleSmall
+                          ?.copyWith(fontWeight: FontWeight.w600)),
+                ),
+              ),
+              for (final id in _readerActionIds)
+                ListTile(
+                  leading: Icon(
+                      buttonDefById(id)?.icon ?? _readerAction(id).icon),
+                  title: Text(switch (buttonDefById(id)) {
+                    final def? => localizedCardButtonLabel(l, def),
+                    null => _readerAction(id).label,
+                  }),
+                  trailing: id == current
+                      ? Icon(Icons.check_rounded, color: cs.primary)
+                      : null,
+                  onTap: () => Navigator.pop(ctx, id),
+                ),
+              const SizedBox(height: 8),
+            ]),
+          ),
+        );
+      },
+    );
+    if (picked == null || picked == current || !mounted) return;
+    setState(() => _barAction = picked);
+    await ScopedPrefs.setString(_kBarAction, picked);
+  }
+
+  Future<void> _showAudioChapters(Color accent, TextTheme tt) async {
+    final l = AppLocalizations.of(context)!;
+    final player = AudioPlayerService();
+    final cast = ChromecastService();
+    final castingThis = cast.isCasting && cast.castingItemId == widget.itemId;
+    final isActive = player.hasBook && player.currentItemId == widget.itemId;
+    final chapters = castingThis
+        ? cast.castingChapters
+        : (isActive ? player.chapters : _audioChapters);
+    if (chapters.isEmpty) {
+      showOverlayToast(context, l.noChaptersBook, icon: Icons.list_rounded);
+      return;
+    }
+    double pos;
+    if (castingThis) {
+      pos = cast.castPosition.inMilliseconds / 1000.0;
+    } else if (isActive) {
+      pos = player.position.inMilliseconds / 1000.0;
+    } else {
+      pos = await ProgressSyncService().getSavedPosition(widget.itemId);
+    }
+    final speedAdjusted = await PlayerSettings.getSpeedAdjustedTime();
+    if (!mounted) return;
+    showChaptersSheet(
+      context: context,
+      accent: accent,
+      tt: tt,
+      chapters: chapters,
+      totalDuration: castingThis
+          ? cast.castingDuration
+          : (isActive ? player.totalDuration : _audioDuration),
+      currentPosition: pos,
+      isPlaybackActive: isActive || castingThis,
+      isCastingThis: castingThis,
+      displaySpeed: speedAdjusted && isActive ? player.speed : 1.0,
+      player: player,
+      itemId: widget.itemId,
+    );
+  }
+
+  void _castFromReader() {
+    final cast = ChromecastService();
+    final api = context.read<AuthProvider>().apiService;
+    final coverUrl = api?.getCoverUrl(widget.itemId);
+    if (cast.isCasting && cast.castingItemId == widget.itemId) {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: Theme.of(context).bottomSheetTheme.backgroundColor,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        builder: (_) => CastControlSheet(),
+      );
+    } else if (cast.isConnected) {
+      if (api != null) {
+        cast.castItem(
+          api: api,
+          itemId: widget.itemId,
+          title: widget.title,
+          author: _audioAuthor,
+          coverUrl: coverUrl,
+          totalDuration: _audioDuration,
+          chapters: _audioChapters,
+        );
+      }
+    } else {
+      showCastDevicePicker(
+        context,
+        api: api,
+        itemId: widget.itemId,
+        title: widget.title,
+        author: _audioAuthor,
+        coverUrl: coverUrl,
+        totalDuration: _audioDuration,
+        chapters: _audioChapters,
+      );
+    }
+  }
+
+  Future<void> _downloadFromReader() async {
+    final api = context.read<AuthProvider>().apiService;
+    if (api == null) return;
+    final error = await DownloadService().downloadItem(
+      api: api,
+      itemId: widget.itemId,
+      title: widget.title,
+      author: _audioAuthor,
+      coverUrl: api.getCoverUrl(widget.itemId),
+      libraryId: context.read<LibraryProvider>().selectedLibraryId,
+    );
+    if (!mounted) return;
+    showOverlayToast(
+      context,
+      error ?? AppLocalizations.of(context)!.readerDownloadStarted,
+      icon: error != null ? Icons.error_outline_rounded : Icons.download_rounded,
+    );
+  }
+
+  /// Playback controls for immersion reading (listen while you read). Drives the
+  /// shared player; only shown while a book is loaded.
+  Widget _buildMediaBar(Color fg, Color accent) {
+    final player = AudioPlayerService();
+    return ListenableBuilder(
+      listenable: player,
+      builder: (context, _) {
+        // This book is the live session?
+        final isActive = player.hasBook && player.currentItemId == widget.itemId;
+        // Show whenever this book has audio, or it's already the active session.
+        if (!isActive && !_hasAudio) return const SizedBox.shrink();
+        final fwdIcon = _forwardSkip == 5
+            ? Icons.forward_5_rounded
+            : _forwardSkip == 10 ? Icons.forward_10_rounded : Icons.forward_30_rounded;
+        final backIcon = _backSkip == 5
+            ? Icons.replay_5_rounded
+            : _backSkip == 10 ? Icons.replay_10_rounded : Icons.replay_30_rounded;
+        final dim = fg.withValues(alpha: 0.3);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 64,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _barShortcut(fg, dim),
+                ),
+              ),
+              Expanded(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // Skips only act on the live session.
+                    IconButton(
+                      icon: Icon(backIcon, color: isActive ? fg : dim),
+                      iconSize: 30,
+                      onPressed: isActive ? () => player.skipBackward(_backSkip) : null,
+                    ),
+                    IconButton(
+                      icon: Icon(
+                        (isActive && player.isPlaying)
+                            ? Icons.pause_circle_filled_rounded
+                            : Icons.play_circle_filled_rounded,
+                        color: accent,
+                      ),
+                      iconSize: 48,
+                      // Active: toggle. Otherwise start this book's audiobook.
+                      onPressed: _startingAudio
+                          ? null
+                          : (isActive
+                                ? () {
+                                    final starting = !player.isPlaying;
+                                    player.togglePlayPause(fromUi: true);
+                                    if (starting) {
+                                      _maybeOfferCatchUp(audioStarting: true);
+                                    }
+                                  }
+                                : _startThisBook),
+                    ),
+                    IconButton(
+                      icon: Icon(fwdIcon, color: isActive ? fg : dim),
+                      iconSize: 30,
+                      onPressed: isActive ? () => player.skipForward(_forwardSkip) : null,
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(
+                width: 64,
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: IconButton(
+                    icon: Icon(Icons.keyboard_arrow_up_rounded, color: fg),
+                    tooltip: AppLocalizations.of(context)!.readerMoreControls,
+                    onPressed: _showReaderControls,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// The accent as drawn on the page. E-ink builds are monochrome, so the
+  /// theme accent is black and vanishes on the dark and grey looks; the
+  /// page's own text colour stands in whenever the accent would not contrast
+  /// with the page behind it.
+  Color _accentOn(Color bg, Color fg, Color accent) {
+    if (PlayerSettings.einkMode) return fg;
+    final la = accent.computeLuminance();
+    final lb = bg.computeLuminance();
+    final hi = la > lb ? la : lb;
+    final lo = la > lb ? lb : la;
+    return (hi + 0.05) / (lo + 0.05) < 2.0 ? fg : accent;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final palette = _resolvePalette(context);
+    final bg = palette.bgColor;
+    final fg = palette.fgColor;
+    final fgDim = fg.withValues(alpha: 0.6);
+    final accent = _accentOn(bg, fg, cs.primary);
+
+    // Hold the heavy WebView until the open animation finishes — mounting it
+    // mid-transition (e.g. for an already-cached book) stutters the slide-in.
+    if (_loading || !_entered) {
+      return _wrap(
+        const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+        bg,
+        appBar: AppBar(
+          title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          backgroundColor: Colors.transparent,
+        ),
+      );
+    }
+
+    if (_error != null || _cachedFile == null) {
+      return _wrap(
+        Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Text(_error ?? '未知错误', textAlign: TextAlign.center,
+                style: TextStyle(color: cs.onSurfaceVariant)),
+          ),
+        ),
+        bg,
+        appBar: AppBar(title: Text(widget.title)),
+      );
+    }
+
+    // EpubViewer + overlays, each wrapped in a SafeArea for camera cutouts.
+    final viewerBody = Stack(
+      children: [
+          // Epub viewer with safe area padding for camera cutouts. With the
+          // bar pinned, it is a shorter box under the bar rather than a full
+          // page with the bar over it, so nothing the page shows is hidden
+          // and read along and auto scroll measure the page they can see.
+          _withPinnedTopBar(bg, fg, fgDim, accent, _buildViewerArea(EpubViewer(
+              key: ValueKey(_viewerKey),
+              epubSource: EpubSource.fromFile(_cachedFile!),
+              epubController: _epubController!,
+              initialCfi: _initialCfi,
+              cachedLocations: _cachedLocations,
+              onLocationsGenerated: (json) {
+                debugPrint('[EbookReader] locations generated item=${widget.itemId} chars=${json.length}');
+                final file = _cachedFile;
+                if (file != null) saveCachedLocations(file, json);
+              },
+              displaySettings: EpubDisplaySettings(
+                flow: _scroll ? EpubFlow.scrolled : EpubFlow.paginated,
+                spread: _scroll ? EpubSpread.none : _spread,
+                // Swipe-to-turn via epub.js's snap manager is janky inside the
+                // WebView and never fires on iOS, so it's off. Page turns come
+                // from edge taps; horizontal drags are swallowed below.
+                snap: false,
+                useSnapAnimationAndroid: false,
+                // Font size at load time, not applied after: a post-load
+                // setFontSize reflows the text after initialCfi has displayed,
+                // which would drift the resume position.
+                fontSize: _fontSize,
+                theme: _buildTheme(palette),
+              ),
+              onChaptersLoaded: (chapters) {
+                debugPrint('[EbookReader] onChaptersLoaded item=${widget.itemId} count=${chapters.length}');
+                if (mounted) setState(() => _chapters = _flattenChapters(chapters));
+              },
+              // Fires once the plugin finishes generating its location index;
+              // value.progress is only meaningful (and stable) after this.
+              onLocationLoaded: () {
+                debugPrint('[EbookReader] onLocationLoaded item=${widget.itemId}');
+                if (mounted) setState(() => _locationsReady = true);
+                // A find jump right after open lands before this index exists,
+                // so its refresh got page/chapter but percentage=0 - and no
+                // relocated fires until a page turn. Recompute now it can.
+                if (_didStartFind) _refreshLocationAfterJump();
+                // Index built after the first paint: make the percent jump now.
+                // A cached index lands before the first paint, and the load
+                // rescue below makes the jump instead, so its start re-display
+                // can't undo it.
+                final jump = _pendingPercentJump;
+                if (jump != null && _didLoadRescue) {
+                  _pendingPercentJump = null;
+                  _epubController?.toProgressPercentage(jump);
+                }
+              },
+              onLoadError: (message) {
+                if (!mounted) return;
+                setState(() => _error = AppLocalizations.of(context)!.readerCouldNotOpen);
+              },
+              suppressNativeContextMenu: true,
+              onSelection: _onSelection,
+              onDeselection: () {
+                if (mounted) setState(() => _clearSelection());
+              },
+              onAnnotationClicked: (cfi, rect) => _onHighlightTapped(cfi),
+              onEpubLoaded: () {
+                // Re-display once to rescue an occasionally-blank first paint.
+                // Guarded so it runs at most once per mount: onEpubLoaded fires
+                // on every epub.js "displayed" event, so an unguarded re-display
+                // would re-trigger itself forever (freezing taps and snapping
+                // back to the start). Position-safe: font size and theme are
+                // already in displaySettings, so nothing reflows after this.
+                if (!_didLoadRescue) {
+                  _didLoadRescue = true;
+                  final once = _initialCfi;
+                  var rescue = 'start';
+                  if (once != null && once.isNotEmpty) {
+                    rescue = 'cfi';
+                    _initialCfi = null;
+                    _epubController?.display(cfi: once);
+                    // Safe to re-display: _didLoadRescue is already set, so the
+                    // "displayed" event this fires can't loop back in here.
+                    final settle = _settleJumpCfi;
+                    if (settle != null) {
+                      _settleJumpCfi = null;
+                      Future.delayed(const Duration(milliseconds: 700), () {
+                        if (mounted) _epubController?.display(cfi: settle);
+                      });
+                    }
+                  } else if (_pendingPercentJump != null && _locationsReady) {
+                    rescue = 'percent';
+                    _epubController?.toProgressPercentage(_pendingPercentJump!);
+                    _pendingPercentJump = null;
+                  } else {
+                    // First open (no saved position) - the same blank-first-paint
+                    // can happen here, but display(cfi:) needs a target, so force
+                    // epub.js to re-display the start directly.
+                    _epubController?.webViewController?.evaluateJavascript(
+                        source: 'try{rendition.display();}catch(e){}');
+                  }
+                  debugPrint('[EbookReader] onEpubLoaded item=${widget.itemId} rescue=$rescue');
+                }
+                if (!_didInitViewer) {
+                  _didInitViewer = true;
+                  _loadAnnotations().then((_) => _restoreHighlights());
+                  _setupPageInfoHandler();
+                  _setupTapHandler();
+                  _applyTurnStyle();
+                  _queueCurlShot();
+                  _setupAutoScrollHandlers();
+                  _setupFontInjector();
+                  _applyFontFace();
+                }
+                if (widget.startReadAlong && !_didAutoReadAlong) {
+                  _didAutoReadAlong = true;
+                  Future.delayed(const Duration(milliseconds: 900), () {
+                    if (mounted && !_readAlongOn) _toggleReadAlong();
+                  });
+                }
+                unawaited(_narrationOpenAtAudio());
+                if (!_didScheduleCatchUp) {
+                  _didScheduleCatchUp = true;
+                  // Past the load rescue and settle re-displays.
+                  Future.delayed(const Duration(milliseconds: 2500), () {
+                    if (mounted) _catchUpOnOpen();
+                  });
+                }
+                final findText = widget.findText;
+                if (findText != null && findText.isNotEmpty && !_didStartFind) {
+                  _didStartFind = true;
+                  // Let the load rescue / settle re-displays finish first, so
+                  // the find's own display() calls don't race them.
+                  Future.delayed(const Duration(milliseconds: 900), () {
+                    if (mounted) _runFindInEbook(findText, widget.findChapterHint);
+                  });
+                }
+              },
+              onRelocated: (value) {
+                if (!mounted) return;
+                final landed = _curlLanded;
+                if (landed != null && !landed.isCompleted) landed.complete(true);
+                _readAlongTurnPending = null;
+                // Ignore relocations while backgrounded: the recents/resize
+                // re-paginate fires a stray one that would save the wrong page.
+                // Note it so the resume path knows the page needs restoring.
+                if (!_readerActive) {
+                  _bgDrifted = true;
+                  return;
+                }
+                _currentCfi = value.startCfi;
+                _firstShownCfi ??= value.startCfi;
+                _queueCurlShot();
+                _updateBookmarkState();
+                _repaintHighlightMarks();
+                // The start page shown while waiting to jump to another app's
+                // saved percentage isn't the reader's spot - don't save it.
+                // Turning off it (or a find / read along move) drops the jump.
+                if (_pendingPercentJump != null) {
+                  if (value.startCfi == _firstShownCfi) return;
+                  _pendingPercentJump = null;
+                }
+                if (_locationsReady) {
+                  // Trust the percentage only once epub.js has built its
+                  // location index. Before that it reports a bogus spine
+                  // estimate that jumps around (e.g. 75% then 25%) — pushing
+                  // it would corrupt the server's percent and could even mark
+                  // the book finished (isFinished = progress >= 1.0).
+                  setState(() => _progress = value.progress);
+                  _syncProgress(value.startCfi, value.progress);
+                } else {
+                  // Still save the fresh position, but keep the last-known-good
+                  // percentage so the stored progress never regresses.
+                  _syncProgress(value.startCfi, _progress);
+                }
+              },
+              onTouchDown: (x, y) {
+                _touchDownX = x;
+                _touchDownY = y;
+                _touchDownAt = DateTime.now();
+              },
+              onTouchUp: (x, y) {
+                // onTouchDown doesn't fire reliably on iOS; if we never got a
+                // down point, treat this as a tap (0 movement) instead of
+                // rejecting it, otherwise no taps register at all.
+                final dx = _touchDownX != null ? (x - _touchDownX!).abs() : 0.0;
+                final dy = _touchDownY != null ? (y - _touchDownY!).abs() : 0.0;
+                _touchDownX = null;
+                _touchDownY = null;
+                _touchDownAt = null;
+                if (dx > 0.05 || dy > 0.05) {
+                  // A swipe turns the page on Android, and a drag scrolls it
+                  // in scroll mode.
+                  if (_scroll ? dy > 0.05 : dx > dy) {
+                    _userMoved(_scroll ? 'scroll' : 'swipe');
+                    // The page can relocate before the finger lifts, while
+                    // the place was still held, so save where it came to.
+                    final cfi = _currentCfi;
+                    if (cfi != null) _syncProgress(cfi, _progress);
+                  }
+                  return;
+                }
+                _readerTapAt(x, y, 'touch');
+              },
+          ))),
+
+          // Top overlay: what you are reading and how far in. Controls live
+          // at the bottom now, in thumb reach. Pinned, it sits above the page
+          // in the column built below instead of fading in over it.
+          if (!_pinTop)
+            AnimatedOpacity(
+              opacity: _showControls ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              child: IgnorePointer(
+                ignoring: !_showControls,
+                child: _controlsTouchGuard(Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        bg.withValues(alpha: 1.0),
+                        bg.withValues(alpha: 1.0),
+                        bg.withValues(alpha: 0.0),
+                      ],
+                      stops: const [0.0, 0.86, 1.0],
+                    ),
+                  ),
+                  child: SafeArea(
+                    bottom: false,
+                    child: _buildTopBarContent(fg, fgDim, accent),
+                  ),
+                )),
+              ),
+            ),
+
+          // Bottom overlay: every control, centred and within thumb reach.
+          Positioned(
+            left: 0, right: 0, bottom: 0,
+            child: AnimatedOpacity(
+              opacity: _showControls ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              child: IgnorePointer(
+                ignoring: !_showControls,
+                child: _controlsTouchGuard(Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [
+                        bg.withValues(alpha: 1.0),
+                        bg.withValues(alpha: 1.0),
+                        bg.withValues(alpha: 0.0),
+                      ],
+                      stops: const [0.0, 0.86, 1.0],
+                    ),
+                  ),
+                  child: SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(4, 6, 4, 2),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_readAlongOn)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 6),
+                              child: Center(
+                                // Browsing with the lit sentence still in
+                                // view leaves nothing to go back to.
+                                child: _readAlongBrowsing && !(_narrationReadAlong && _narrationOnScreen)
+                                    ? _backToNarrationButton(accent)
+                                    : _narrationReadAlong
+                                        // The book's own timings need no sync tuning.
+                                        ? const SizedBox.shrink()
+                                        : _readAlongSyncPill(fg),
+                              ),
+                            ),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: _buildMediaBar(fg, accent),
+                          ),
+                          // Equal cells: on a narrow phone they shrink below
+                          // the buttons' 48dp instead of overflowing the row.
+                          Row(
+                            children: [
+                              for (final id in const ['bookmark', 'readalong', 'notes', 'autoscroll', 'settings', 'chapters'])
+                                if (_barButtonShown(id)) Expanded(child: _barButton(id, fg, accent)),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )),
+              ),
+            ),
+          ),
+
+          if (_readAlongPrep != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Center(child: _readAlongPrepCard(bg, fg, accent)),
+              ),
+            ),
+
+          // Selection toolbar - appears when text is selected
+          if (_selectionRect != null && _selectionCfi != null)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: MediaQuery.of(context).padding.bottom + 16,
+              child: Center(
+                child: Material(
+                  elevation: 8,
+                  borderRadius: BorderRadius.circular(28),
+                  color: cs.surfaceContainer,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final color in HighlightColor.values)
+                          _HighlightColorButton(
+                            color: Color(int.parse('FF${color.hex.substring(1)}', radix: 16)),
+                            onTap: () => _addHighlight(color),
+                          ),
+                        _divider(cs),
+                        IconButton(
+                          icon: Icon(Icons.copy_rounded, size: 20, color: cs.onSurfaceVariant),
+                          onPressed: _copySelection,
+                          tooltip: AppLocalizations.of(context)!.readerTooltipCopy,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.search_rounded, size: 20, color: cs.onSurfaceVariant),
+                          onPressed: _searchSelection,
+                          tooltip: AppLocalizations.of(context)!.readerTooltipSearch,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.menu_book_rounded, size: 20, color: cs.onSurfaceVariant),
+                          onPressed: _defineSelection,
+                          tooltip: AppLocalizations.of(context)!.readerTooltipDefine,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        if (_transcriptionOn || _useNarration)
+                          IconButton(
+                            icon: Icon(
+                                _useNarration ? Icons.play_arrow_rounded : Icons.headphones_rounded,
+                                size: 20,
+                                color: cs.onSurfaceVariant),
+                            onPressed: _findInAudiobookFromSelection,
+                            tooltip: _useNarration
+                                ? AppLocalizations.of(context)!.narrationPlayFromHere
+                                : AppLocalizations.of(context)!.findInAudiobook,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        _divider(cs),
+                        IconButton(
+                          icon: Icon(Icons.close_rounded, size: 20, color: cs.onSurfaceVariant),
+                          onPressed: _dismissSelection,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+        ],
+      );
+    return _wrap(viewerBody, bg);
+  }
+}
+
+/// Payload returned from [_EbookSearchScreen]'s runSearch callback.
+class _SearchPayload {
+  final String query;
+  final List<EpubSearchResult> results;
+  final List<String?> chapters;
+  const _SearchPayload({required this.query, required this.results, required this.chapters});
+}
+
+/// Fullscreen search screen. Opaque route — covers the reader entirely so
+/// soft-keyboard taps can't reach the underlying WebView's JS swipe/tap
+/// handlers. Pop with a result to ask the reader to jump there.
+class _EbookSearchScreen extends StatefulWidget {
+  final String initialQuery;
+  final List<EpubSearchResult> initialResults;
+  final List<String?> initialChapters;
+  final String initialLastQuery;
+  final Future<_SearchPayload> Function(String) runSearch;
+
+  const _EbookSearchScreen({
+    required this.initialQuery,
+    required this.initialResults,
+    required this.initialChapters,
+    required this.initialLastQuery,
+    required this.runSearch,
+  });
+
+  @override
+  State<_EbookSearchScreen> createState() => _EbookSearchScreenState();
+}
+
+class _EbookSearchScreenState extends State<_EbookSearchScreen> {
+  late final TextEditingController _controller;
+  late String _lastQuery;
+  late List<EpubSearchResult> _results;
+  late List<String?> _chapters;
+  bool _searching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialQuery);
+    _lastQuery = widget.initialLastQuery;
+    _results = widget.initialResults;
+    _chapters = widget.initialChapters;
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _run() async {
+    final q = _controller.text.trim();
+    if (q.isEmpty) return;
+    setState(() => _searching = true);
+    try {
+      final payload = await widget.runSearch(q);
+      if (!mounted) return;
+      setState(() {
+        _results = payload.results;
+        _chapters = payload.chapters;
+        _lastQuery = payload.query;
+        _searching = false;
+      });
+    } catch (e) {
+      debugPrint('[Search] runSearch error: $e');
+      if (!mounted) return;
+      setState(() {
+        _results = [];
+        _chapters = [];
+        _searching = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    return Scaffold(
+      backgroundColor: cs.surface,
+      appBar: AppBar(
+        backgroundColor: cs.surface,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+        titleSpacing: 0,
+        title: TextField(
+          controller: _controller,
+          autofocus: true,
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            hintText: AppLocalizations.of(context)!.readerSearchHint,
+            border: InputBorder.none,
+          ),
+          onSubmitted: (_) => _run(),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.search_rounded),
+            onPressed: _searching ? null : _run,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (_searching)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+            )
+          else if (_results.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+              child: Row(
+                children: [
+                  Text(
+                    AppLocalizations.of(context)!.readerSearchMatches(_results.length, _lastQuery),
+                    style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: _searching
+                ? const SizedBox.shrink()
+                : _results.isEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text(
+                            _lastQuery.isEmpty
+                                ? AppLocalizations.of(context)!.readerSearchEmpty
+                                : AppLocalizations.of(context)!.readerSearchNoResults(_lastQuery),
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: cs.onSurfaceVariant),
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        itemCount: _results.length,
+                        separatorBuilder: (_, __) => Divider(
+                          height: 1,
+                          color: cs.onSurface.withValues(alpha: 0.06),
+                        ),
+                        itemBuilder: (ctx, i) {
+                          final r = _results[i];
+                          final chapter = i < _chapters.length ? _chapters[i] : null;
+                          return ListTile(
+                            title: _SearchExcerpt(excerpt: r.excerpt, query: _lastQuery),
+                            subtitle: chapter == null
+                                ? null
+                                : Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Text(
+                                      chapter,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: tt.bodySmall?.copyWith(
+                                        color: cs.onSurfaceVariant,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  ),
+                            dense: true,
+                            onTap: () => Navigator.of(context).pop(r),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Renders a search excerpt with the matched query bold + tinted so the user
+/// can spot which word the hit was on.
+class _SearchExcerpt extends StatelessWidget {
+  final String excerpt;
+  final String query;
+
+  const _SearchExcerpt({required this.excerpt, required this.query});
+
+  @override
+  Widget build(BuildContext context) {
+    final tt = Theme.of(context).textTheme;
+    final cs = Theme.of(context).colorScheme;
+    final base = tt.bodyMedium ?? const TextStyle();
+    if (query.isEmpty) {
+      return Text(excerpt, maxLines: 3, overflow: TextOverflow.ellipsis, style: base);
+    }
+    final lower = excerpt.toLowerCase();
+    final q = query.toLowerCase();
+    final spans = <TextSpan>[];
+    var i = 0;
+    while (i < excerpt.length) {
+      final hit = lower.indexOf(q, i);
+      if (hit == -1) {
+        spans.add(TextSpan(text: excerpt.substring(i)));
+        break;
+      }
+      if (hit > i) spans.add(TextSpan(text: excerpt.substring(i, hit)));
+      spans.add(TextSpan(
+        text: excerpt.substring(hit, hit + q.length),
+        style: TextStyle(fontWeight: FontWeight.w700, color: cs.primary),
+      ));
+      i = hit + q.length;
+    }
+    return Text.rich(
+      TextSpan(style: base, children: spans),
+      maxLines: 3,
+      overflow: TextOverflow.ellipsis,
+    );
+  }
+}
+
+class _HighlightColorButton extends StatelessWidget {
+  final Color color;
+  final VoidCallback onTap;
+
+  const _HighlightColorButton({required this.color, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Container(
+          width: 32,
+          height: 32,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: Colors.black.withValues(alpha: 0.15),
+              width: 1,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The reader's open pages as Find in audiobook's view of the book.
+class _ReaderBookText implements BookTextSource {
+  _ReaderBookText(this._reader);
+
+  final EbookReaderViewState _reader;
+
+  @override
+  Future<List<String>> spineHrefs() => _reader._spineHrefs();
+
+  @override
+  String? chapterForHref(String href) => _reader._chapterForHref(href);
+
+  @override
+  Future<List<double>> sectionCharCounts(int from, int to) => _reader._sectionCharCounts(from, to);
+
+  @override
+  Future<Map<String, dynamic>?> locateTranscriptInSection(int si, String transcript) =>
+      _reader._locateTranscriptInSection(si, transcript);
+}

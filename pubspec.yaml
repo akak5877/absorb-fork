@@ -1,0 +1,176 @@
+name: absorb
+description: An Audiobookshelf Client
+publish_to: 'none'
+version: 1.12.1+310
+
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: any
+  
+  # Networking
+  http: ^1.1.0
+  socket_io_client: ^3.0.2
+  
+  # State Management
+  provider: ^6.1.1
+  
+  # Storage
+  shared_preferences: ^2.2.2
+  
+  # Image caching
+  cached_network_image: ^3.3.0
+
+  # Audio playback
+  just_audio:
+    path: packages/just_audio
+
+  # Secondary engine (libmpv/FFmpeg) used only for formats ExoPlayer cannot
+  # decode, e.g. WMA v2. Everything else keeps using just_audio above.
+  media_kit: ^1.2.6
+  media_kit_libs_android_audio: ^1.3.8
+
+  audio_service:
+    path: packages/audio_service
+
+  # On-device bookmark transcription (Whisper, opt-in). No ffmpeg companion:
+  # we feed it 16kHz mono WAV produced by native decoders (MediaCodec / AVAssetReader).
+  # Vendored from 1.5.2: the arm64 build was plain armv8-a with no dotprod/fp16
+  # kernels, no_fallback was never read out of the request, and there was no way
+  # to see where inference time went. See packages/whisper_ggml_plus.
+  whisper_ggml_plus:
+    path: packages/whisper_ggml_plus
+
+  # Reading EPUB text without a WebView (transcript ebook cross-reference).
+  archive: ^4.0.9
+  html: ^0.15.4
+  xml: ^6.5.0
+
+  # CarPlay - vendored copy of 1.2.11 with a patched image loader (downsampled +
+  # cached list thumbnails) so large browse lists don't run CarPlay out of memory.
+  flutter_carplay:
+    path: packages/flutter_carplay
+  
+  # Permissions
+  permission_handler: ^12.0.1
+
+  # Downloads & offline
+  path_provider: ^2.1.1
+  connectivity_plus: ^6.0.3
+  # Native background downloads (iOS background URLSession, Android foreground service)
+  background_downloader: ^9.0.0
+
+  # In-app APK install (GitHub flavor updater)
+  open_filex: ^4.5.0
+  
+  # Shake detection for sleep timer
+  sensors_plus: ^4.0.2
+
+  # Download notifications
+  flutter_local_notifications: ^17.2.1
+
+  # Background new-episode checks (Android)
+  workmanager: ^0.9.0
+
+  device_info_plus: ^11.0.0
+
+  # choose file location
+  file_picker: ^8.0.0
+
+  package_info_plus: ^8.0.0
+
+  #OIDC
+  crypto: ^3.0.3
+  url_launcher: ^6.2.5
+  flutter_web_auth_2: ^5.0.1
+
+  # Pausing for interruptions
+  audio_session: ^0.1.21
+
+  # chromecast. Vendored without its iOS side: Absorb only casts from
+  # Android, and the plugin's Swift package pulls a Cast SDK that now wants
+  # iOS 16, which broke the iOS build for nothing.
+  flutter_chrome_cast:
+    path: packages/flutter_chrome_cast
+
+  # Log sharing
+  share_plus: ^10.0.0
+  web: ^1.1.1
+  app_links: ^7.2.1
+  qr_flutter: ^4.1.0
+
+  # Homescreen widget
+  home_widget: ^0.7.0
+
+  # App icon long-press shortcuts (Continue Listening / Downloads)
+  quick_actions: ^1.0.8
+
+  # One-time store review prompt (stripped for the F-Droid build)
+  in_app_review: ^2.0.9
+
+  # Splash screen (preserve during init)
+  flutter_native_splash: ^2.4.4
+  vibration: ^3.1.8
+  webview_flutter: ^4.13.1
+  flutter_markdown_plus: ^1.0.7
+  palette_generator: ^0.3.3+7
+
+  # eBook reader - vendored to stream book bytes into the WebView in chunks;
+  # upstream serializes the whole file into one script string, which crashed
+  # the app with OOM on a 322MB illustrated epub
+  flutter_epub_viewer:
+    path: packages/flutter_epub_viewer
+
+  # PDF reader (non-EPUB ebooks route here)
+  pdfrx: 2.10.1
+
+  # foliate-js host for MOBI/AZW3/FB2/CBZ (already transitive via the epub
+  # viewer; pinned direct so the bridge API is a declared dependency)
+  flutter_inappwebview: ^6.0.0
+  flutter_svg: ^2.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+  flutter_launcher_icons: ^0.14.3
+  change_app_package_name: ^1.5.0
+  rename_app: ^1.6.5
+  mocktail: ^1.0.4
+
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    - assets/icon/
+    - assets/audio/
+    - assets/foliate/
+    - assets/foliate/foliate-js/
+    - assets/foliate/foliate-js/vendor/
+  shaders:
+    - shaders/page_ripple.frag
+  fonts:
+    - family: NotoSansJP
+      fonts:
+        - asset: assets/fonts/NotoSansJP-Regular.otf
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+
+flutter_native_splash:
+  color: "#000000"
+  image: "assets/icon/splash_logo.png"
+  android_12:
+    color: "#000000"
+    image: "assets/icon/splash_logo.png"
+  ios: true

@@ -1,0 +1,1083 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../l10n/app_localizations.dart';
+import 'cover_badges.dart';
+import '../providers/auth_provider.dart';
+import '../providers/library_provider.dart';
+import '../services/audio_player_service.dart';
+import '../services/download_service.dart';
+import '../services/ebook_cache.dart';
+import 'absorbing_shared.dart';
+import 'book_detail_sheet.dart';
+import 'books_sheet_shared.dart' show coverGridTextScale, coverGridDecodeWidth;
+import 'cover_image.dart';
+import 'episode_list_sheet.dart';
+import '../services/upcoming_releases_service.dart';
+import 'series_books_sheet.dart';
+import 'author_books_sheet.dart';
+
+// ═══════════════════════════════════════════════════════════════
+// Grid book tile (cover + title + author)
+// ═══════════════════════════════════════════════════════════════
+class GridBookTile extends StatefulWidget {
+  final Map<String, dynamic> item;
+  final double coverAspectRatio;
+  final String? sequenceBadge;
+  final bool showSubtitle;
+  final bool selectionMode;
+  final bool selected;
+  final VoidCallback? onSelectionToggle;
+
+  const GridBookTile({
+    super.key,
+    required this.item,
+    this.coverAspectRatio = 1.0,
+    this.sequenceBadge,
+    this.showSubtitle = false,
+    this.selectionMode = false,
+    this.selected = false,
+    this.onSelectionToggle,
+  });
+
+  @override
+  State<GridBookTile> createState() => _GridBookTileState();
+}
+
+class _GridBookTileState extends State<GridBookTile> {
+  final _dl = DownloadService();
+
+  @override
+  void initState() {
+    super.initState();
+    _dl.addListener(_rebuild);
+  }
+
+  @override
+  void dispose() {
+    _dl.removeListener(_rebuild);
+    super.dispose();
+  }
+
+  void _rebuild() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.watch<LibraryProvider>();
+
+    final itemId = widget.item['id'] as String? ?? '';
+    final media = widget.item['media'] as Map<String, dynamic>? ?? {};
+    final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+    final title = metadata['title'] as String? ?? l.unknown;
+    final subtitle = metadata['subtitle'] as String? ?? '';
+    final author = metadata['authorName'] as String? ?? '';
+    final coverUrl = lib.getCoverUrl(itemId);
+    final progress = lib.getProgress(itemId);
+    final isExplicit = PlayerSettings.showExplicitBadge && metadata['explicit'] == true;
+    final isDownloaded = _dl.isDownloaded(itemId);
+    final hasEbook = PlayerSettings.showEbookBadge && hasEbookFile(widget.item);
+    final isFinished = lib.getProgressData(itemId)?['isFinished'] == true;
+    final isSkimmed = lib.getProgressData(itemId)?['skimmed'] == true;
+    final isSubscribed = lib.isPodcastLibrary && lib.isPodcastSubscribed(itemId);
+    final unfinishedCount =
+        lib.isPodcastLibrary ? lib.getUnfinishedEpisodeCount(widget.item) : 0;
+
+    return GestureDetector(
+      // opaque so taps on the blank space below the title (the tile's tall
+      // aspect ratio leaves a gap when the Column children stop short)
+      // still trigger the onTap. Without this, taps in that blank strip
+      // miss the Column's hit test and nothing happens.
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (widget.selectionMode && widget.onSelectionToggle != null) {
+          widget.onSelectionToggle!();
+          return;
+        }
+        if (itemId.isNotEmpty) {
+          if (lib.isPodcastItem(widget.item)) {
+            EpisodeListSheet.show(context, widget.item);
+          } else {
+            showBookDetailSheet(context, itemId);
+          }
+        }
+      },
+      // Long-press a book cover for the quick-actions sheet (podcasts skipped).
+      // Selection mode owns the gesture instead, so a long-press can't fire a
+      // sheet over a grid the user is ticking through.
+      onLongPress:
+          (!widget.selectionMode && itemId.isNotEmpty && !lib.isPodcastLibrary)
+          ? () => showQuickActionsSheet(context, itemId, initialItem: widget.item)
+          : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Cover
+          AspectRatio(
+            aspectRatio: widget.coverAspectRatio,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  // Cover image
+                  coverUrl != null
+                      ? _blurCover(coverUrl, lib.mediaHeaders, cs, widget.coverAspectRatio, title, author)
+                      : CoverPlaceholder(title: title, author: author),
+
+                  // Progress bar at bottom of cover
+                  if (progress > 0 && !isFinished)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: LinearProgressIndicator(
+                        value: progress.clamp(0.0, 1.0),
+                        minHeight: 3,
+                        backgroundColor: Colors.black38,
+                        valueColor: AlwaysStoppedAnimation(cs.primary),
+                      ),
+                    ),
+
+                  // Unplayed-episode count badge (podcasts only)
+                  if (unfinishedCount > 0)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: cs.primary,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          '$unfinishedCount',
+                          style: TextStyle(
+                            color: cs.onPrimary,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // Subscribed bell (sits below unplayed badge when both show)
+                  if (isSubscribed)
+                    Positioned(
+                      top: unfinishedCount > 0 ? 26 : 4,
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.all(3),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.6),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(Icons.notifications_rounded,
+                            size: 11, color: Colors.white),
+                      ),
+                    ),
+
+                  // Explicit badge
+                  if (isExplicit)
+                    Positioned(
+                      top: (unfinishedCount > 0 ? 26 : 4) + (isSubscribed ? 22 : 0),
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.red.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(l.libraryGridTilesExplicitBadge, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+
+                  if (hasEbook && !widget.selectionMode)
+                    Positioned(
+                      top: widget.sequenceBadge != null ? 24 : 4, left: 4,
+                      child: const EbookCoverBadge(),
+                    ),
+
+                  // Sequence badge
+                  if (widget.sequenceBadge != null)
+                    Positioned(
+                      top: 4, left: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.7),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(l.libraryGridTilesSequence(widget.sequenceBadge!),
+                          style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w600)),
+                      ),
+                    ),
+
+                  // ── State badges (downloaded / finished) ──
+                  if (isFinished || isDownloaded)
+                    Positioned(
+                      left: 0, right: 0, bottom: 0,
+                      child: CoverStateBadges(
+                        isDownloaded: isDownloaded,
+                        isFinished: isFinished,
+                        isSkimmed: isSkimmed,
+                      ),
+                    ),
+
+                  // ── Batch selection ──
+                  if (widget.selectionMode) ...[
+                    if (widget.selected)
+                      Positioned.fill(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: cs.primary, width: 3),
+                            borderRadius: BorderRadius.circular(10),
+                            color: cs.primary.withValues(alpha: 0.18),
+                          ),
+                        ),
+                      ),
+                    Positioned(
+                      top: 4,
+                      left: 4,
+                      child: Container(
+                        width: 26,
+                        height: 26,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: widget.selected
+                              ? cs.primary
+                              : Colors.black.withValues(alpha: 0.55),
+                          border: Border.all(
+                            color: widget.selected ? cs.primary : Colors.white70,
+                          ),
+                        ),
+                        child: Icon(
+                          widget.selected
+                              ? Icons.check_rounded
+                              : Icons.circle_outlined,
+                          size: 17,
+                          color: widget.selected ? cs.onPrimary : Colors.white70,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 5),
+          // Title
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: cs.onSurface,
+              fontSize: 11 * coverGridTextScale(context),
+            ),
+          ),
+          // Subtitle. A book without one hands the line to the author instead
+          // of leaving a gap under the title.
+          if (widget.showSubtitle && subtitle.isNotEmpty)
+            Text(
+              subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant.withValues(alpha: 0.75),
+                fontSize: 10 * coverGridTextScale(context),
+              ),
+            ),
+          // Author
+          if (author.isNotEmpty)
+            Text(
+              author,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+                fontSize: 10 * coverGridTextScale(context),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _blurCover(String coverUrl, Map<String, String> headers, ColorScheme cs, double aspectRatio, String title, String author) {
+    final placeholder = CoverPlaceholder(title: title, author: author);
+    final isSquare = (aspectRatio - 1.0).abs() < 0.01;
+    final decodeWidth = coverGridDecodeWidth(context);
+    if (!isSquare) {
+      if (coverUrl.startsWith('/')) {
+        return Image.file(File(coverUrl), fit: BoxFit.cover,
+            cacheWidth: decodeWidth,
+            errorBuilder: (_, __, ___) => placeholder);
+      }
+      return CoverImage(url: coverUrl, fit: BoxFit.cover,
+          headers: headers, memCacheWidth: decodeWidth,
+          placeholder: placeholder,
+          errorWidget: placeholder);
+    }
+    // The letterbox fill behind non-square art. A real gaussian here means one
+    // offscreen blur layer per tile, which piles up GPU memory on dense grids
+    // and gets the app OOM-killed mid-scroll - a tiny decode stretched to size
+    // looks the same under the scrim at tile sizes and costs nothing.
+    if (coverUrl.startsWith('/')) {
+      return Stack(fit: StackFit.expand, children: [
+        Image.file(File(coverUrl), fit: BoxFit.cover, cacheWidth: 32,
+            errorBuilder: (_, __, ___) => const SizedBox.shrink()),
+        Container(color: Colors.black.withValues(alpha: 0.15)),
+        Image.file(File(coverUrl), fit: BoxFit.contain,
+            cacheWidth: decodeWidth,
+            errorBuilder: (_, __, ___) => placeholder),
+      ]);
+    }
+    return Stack(fit: StackFit.expand, children: [
+      CoverImage(url: coverUrl, fit: BoxFit.cover,
+          headers: headers, memCacheWidth: 32,
+          errorWidget: const SizedBox.shrink()),
+      Container(color: Colors.black.withValues(alpha: 0.15)),
+      CoverImage(url: coverUrl, fit: BoxFit.contain,
+          headers: headers, memCacheWidth: decodeWidth,
+          placeholder: placeholder,
+          errorWidget: placeholder),
+    ]);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stacked cover art for series tiles
+// Shows up to 3 covers offset behind each other.
+// ═══════════════════════════════════════════════════════════════
+class _StackedCovers extends StatelessWidget {
+  final List<String?> coverUrls;
+  final int numBooks;
+  final Map<String, String> mediaHeaders;
+  final ColorScheme cs;
+  final double seriesProgress;
+  final int booksFinished;
+  final double coverAspectRatio;
+
+  const _StackedCovers({
+    required this.coverUrls,
+    required this.numBooks,
+    required this.mediaHeaders,
+    required this.cs,
+    this.seriesProgress = 0,
+    this.booksFinished = 0,
+    this.coverAspectRatio = 1.0,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // Cap at 3 stacked covers (front + two back). 4 was visually busy and the
+    // extra image decodes + per-shadow blur repaints made the Series grid
+    // visibly janky during scroll.
+    final count = coverUrls.length.clamp(1, 3);
+
+    const inset = 5.0;
+    final totalOffset = count > 1 ? inset * (count - 1) : 0.0;
+
+    return AspectRatio(
+      aspectRatio: coverAspectRatio,
+      child: RepaintBoundary(
+        child: Stack(
+        children: [
+          // Back covers (furthest back first so front paints on top). Drop
+          // the per-back-cover BoxShadow blur — front cover's shadow is
+          // enough visual depth and blurred shadows are expensive.
+          for (int i = count - 1; i > 0; i--)
+            Positioned(
+              top: (totalOffset - i * inset),
+              right: (totalOffset - i * inset),
+              left: i * inset,
+              bottom: i * inset,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: _coverImage(context, coverUrls[i]),
+              ),
+            ),
+          // Front cover (bottom-left)
+          Positioned(
+            top: totalOffset,
+            right: totalOffset,
+            left: 0,
+            bottom: 0,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: count > 1
+                    ? [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.2),
+                          blurRadius: 3,
+                          offset: const Offset(-1, 1),
+                        ),
+                      ]
+                    : [],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    _coverImage(context, coverUrls.isNotEmpty ? coverUrls[0] : null),
+                    // Series progress bar
+                    if (seriesProgress > 0 && booksFinished < numBooks)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: LinearProgressIndicator(
+                          value: seriesProgress.clamp(0.0, 1.0),
+                          minHeight: 3,
+                          backgroundColor: Colors.black38,
+                          valueColor: AlwaysStoppedAnimation(cs.primary),
+                        ),
+                      ),
+                    // Finished banner
+                    if (booksFinished > 0 && booksFinished >= numBooks)
+                      const Positioned(
+                        left: 0, right: 0, bottom: 0,
+                        child: CoverStateBadges(isDownloaded: false, isFinished: true),
+                      ),
+                    // Book count badge
+                    Positioned(
+                      top: 6,
+                      right: 6,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: cs.primaryContainer,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.auto_stories_rounded, size: 11, color: cs.onPrimaryContainer),
+                            const SizedBox(width: 3),
+                            Text(booksFinished > 0 && booksFinished < numBooks
+                                ? '$booksFinished/$numBooks'
+                                : '$numBooks',
+                              style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
+                                color: cs.onPrimaryContainer)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      ),
+    );
+  }
+
+  Widget _coverImage(BuildContext context, String? url) {
+    if (url == null) return _placeholder();
+    final decodeWidth = coverGridDecodeWidth(context);
+    // Series stacked covers are always cropped to fit - no blur padding needed
+    if (url.startsWith('/')) {
+      return Image.file(File(url), fit: BoxFit.cover,
+          cacheWidth: decodeWidth,
+          errorBuilder: (_, __, ___) => _placeholder());
+    }
+    return CoverImage(url: url, fit: BoxFit.cover,
+        headers: mediaHeaders, memCacheWidth: decodeWidth,
+        placeholder: _placeholder(),
+        errorWidget: _placeholder());
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: cs.surfaceContainerHighest,
+      child: Center(
+        child: Icon(Icons.auto_stories_rounded,
+            size: 24, color: cs.onSurfaceVariant.withValues(alpha: 0.3)),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Grid series tile (collapsed series in browse grid)
+// ═══════════════════════════════════════════════════════════════
+class GridSeriesTile extends StatelessWidget {
+  final Map<String, dynamic> item;
+  final double coverAspectRatio;
+  const GridSeriesTile({super.key, required this.item, this.coverAspectRatio = 1.0});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.watch<LibraryProvider>();
+    final auth = context.read<AuthProvider>();
+
+    final collapsedSeries = item['collapsedSeries'] as Map<String, dynamic>? ?? {};
+    final seriesName = collapsedSeries['name'] as String? ?? l.libraryGridTilesUnknownSeries;
+    final seriesId = collapsedSeries['id'] as String? ?? '';
+    final media = item['media'] as Map<String, dynamic>? ?? {};
+    final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+    final author = metadata['authorName'] as String? ?? '';
+
+    // Gather up to 4 cover URLs from libraryItemIds
+    final itemIds = (collapsedSeries['libraryItemIds'] as List<dynamic>?)
+        ?.map((e) => e as String)
+        .toList() ?? [item['id'] as String? ?? ''];
+    final rawNumBooks = collapsedSeries['numBooks'] as int? ?? 0;
+    final numBooks = rawNumBooks > 0 ? rawNumBooks : itemIds.length;
+    final coverUrls = itemIds
+        .take(4)
+        .map((id) => lib.getCoverUrl(id))
+        .toList();
+
+    // Calculate series progress
+    double totalProgress = 0;
+    int finished = 0;
+    for (final id in itemIds) {
+      final pd = lib.getProgressData(id);
+      if (pd?['isFinished'] == true) {
+        finished++;
+        totalProgress += 1.0;
+      } else {
+        totalProgress += lib.getProgress(id);
+      }
+    }
+    final seriesProgress = itemIds.isNotEmpty ? totalProgress / itemIds.length : 0.0;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (seriesId.isNotEmpty) {
+          showSeriesBooksSheet(
+            context,
+            seriesName: seriesName,
+            seriesId: seriesId,
+            books: const [],
+            itemIds: itemIds,
+            serverUrl: auth.serverUrl,
+            token: auth.token,
+          );
+        }
+      },
+      onLongPress: seriesId.isNotEmpty
+          ? () => showSeriesScanMenu(context, seriesId, seriesName)
+          : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _StackedCovers(
+            coverUrls: coverUrls,
+            numBooks: numBooks,
+            mediaHeaders: lib.mediaHeaders,
+            cs: cs,
+            seriesProgress: seriesProgress,
+            booksFinished: finished,
+            coverAspectRatio: coverAspectRatio,
+          ),
+          const SizedBox(height: 5),
+          Text(
+            seriesName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: cs.onSurface,
+              fontSize: 11 * coverGridTextScale(context),
+            ),
+          ),
+          if (author.isNotEmpty)
+            Text(
+              author,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+                fontSize: 10 * coverGridTextScale(context),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Grid series tile for the series API format (series tab)
+// The series endpoint returns { id, name, books: [...] } instead
+// of the collapsedSeries format used by the library items endpoint.
+// ═══════════════════════════════════════════════════════════════
+class GridSeriesTileDirect extends StatelessWidget {
+  final Map<String, dynamic> series;
+  final double coverAspectRatio;
+  final String? parentSeriesId;
+  const GridSeriesTileDirect({super.key, required this.series, this.coverAspectRatio = 1.0, this.parentSeriesId});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.watch<LibraryProvider>();
+    final auth = context.read<AuthProvider>();
+
+    final seriesName = series['name'] as String? ?? l.libraryGridTilesUnknownSeries;
+    final seriesId = series['id'] as String? ?? '';
+    final books = series['books'] as List<dynamic>? ?? [];
+    // Some servers send the series list without the books, carrying only
+    // libraryItemIds + numBooks (the collapsed-series shape). Covers, count and
+    // progress only need the ids, so fall back to those.
+    final itemIds = books.isNotEmpty
+        ? books
+            .map((b) => (b as Map<String, dynamic>)['id'] as String? ?? '')
+            .where((id) => id.isNotEmpty)
+            .toList()
+        : ((series['libraryItemIds'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const <String>[]);
+    final rawNumBooks = series['numBooks'] as int? ?? 0;
+    final numBooks = books.isNotEmpty
+        ? books.length
+        : (rawNumBooks > 0 ? rawNumBooks : itemIds.length);
+
+    // Get author from first book
+    String author = '';
+    if (books.isNotEmpty) {
+      final firstBook = books.first as Map<String, dynamic>? ?? {};
+      final media = firstBook['media'] as Map<String, dynamic>? ?? {};
+      final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+      author = metadata['authorName'] as String? ?? '';
+    }
+
+    // Gather up to 4 cover URLs
+    final coverUrls = itemIds.take(4).map((id) => lib.getCoverUrl(id)).toList();
+
+    // Calculate series progress
+    double totalProgress = 0;
+    int finished = 0;
+    for (final bookId in itemIds) {
+      final pd = lib.getProgressData(bookId);
+      if (pd?['isFinished'] == true) {
+        finished++;
+        totalProgress += 1.0;
+      } else {
+        totalProgress += lib.getProgress(bookId);
+      }
+    }
+    final seriesProgress =
+        itemIds.isNotEmpty ? totalProgress / itemIds.length : 0.0;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        // When seriesId is missing (e.g. collapsed-series tiles inferred from
+        // book metadata in the author sheet), open the sheet with the books
+        // we already have rather than dropping the tap silently.
+        showSeriesBooksSheet(
+          context,
+          seriesName: seriesName,
+          seriesId: seriesId.isEmpty ? null : seriesId,
+          books: seriesId.isEmpty ? books : const [],
+          itemIds: itemIds,
+          serverUrl: auth.serverUrl,
+          token: auth.token,
+          parentSeriesId: parentSeriesId,
+        );
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _StackedCovers(
+            coverUrls: coverUrls,
+            numBooks: numBooks,
+            mediaHeaders: lib.mediaHeaders,
+            cs: cs,
+            seriesProgress: seriesProgress,
+            booksFinished: finished,
+            coverAspectRatio: coverAspectRatio,
+          ),
+          const SizedBox(height: 5),
+          Text(
+            seriesName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: cs.onSurface,
+              fontSize: 11 * coverGridTextScale(context),
+            ),
+          ),
+          if (author.isNotEmpty)
+            Text(
+              author,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+                fontSize: 10 * coverGridTextScale(context),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Grid tile for a collection or playlist (stacked covers + name + count),
+// styled like a series tile. Used by the library Lists tab.
+// ═══════════════════════════════════════════════════════════════
+class GridListTile extends StatelessWidget {
+  final String name;
+  final List<String> bookIds;
+  final int count;
+  final bool isPlaylist;
+  /// A BookOrbit Smart Scope: its books come from saved rules, not picks.
+  final bool isSmartScope;
+  final double coverAspectRatio;
+  final VoidCallback onTap;
+
+  const GridListTile({
+    super.key,
+    required this.name,
+    required this.bookIds,
+    required this.count,
+    required this.isPlaylist,
+    required this.onTap,
+    this.isSmartScope = false,
+    this.coverAspectRatio = 1.0,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final lib = context.watch<LibraryProvider>();
+
+    final coverUrls = bookIds.take(4).map((id) => lib.getCoverUrl(id)).toList();
+
+    double totalProgress = 0;
+    int finished = 0;
+    for (final id in bookIds) {
+      final pd = lib.getProgressData(id);
+      if (pd?['isFinished'] == true) {
+        finished++;
+        totalProgress += 1.0;
+      } else {
+        totalProgress += lib.getProgress(id);
+      }
+    }
+    final progress = bookIds.isNotEmpty ? totalProgress / bookIds.length : 0.0;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Stack(children: [
+            _StackedCovers(
+              coverUrls: coverUrls.isEmpty ? const [null] : coverUrls,
+              numBooks: count,
+              mediaHeaders: lib.mediaHeaders,
+              cs: cs,
+              seriesProgress: progress,
+              booksFinished: finished,
+              coverAspectRatio: coverAspectRatio,
+            ),
+            if (isSmartScope)
+              Positioned(
+                top: 6,
+                left: 6,
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: cs.primaryContainer,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(Icons.filter_alt_rounded,
+                      size: 14 * coverGridTextScale(context), color: cs.onPrimaryContainer),
+                ),
+              ),
+          ]),
+          const SizedBox(height: 5),
+          Row(
+            children: [
+              Icon(
+                  isPlaylist
+                      ? Icons.playlist_play_rounded
+                      : isSmartScope
+                          ? Icons.filter_alt_rounded
+                          : Icons.collections_bookmark_rounded,
+                  size: 12 * coverGridTextScale(context),
+                  color: cs.onSurfaceVariant),
+              const SizedBox(width: 3),
+              Expanded(
+                child: Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: tt.labelSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                    color: cs.onSurface,
+                    fontSize: 11 * coverGridTextScale(context),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          Text(
+            isPlaylist
+                ? l.playlistDetailItemCount(count)
+                : isSmartScope
+                    ? l.smartScopeBookCount(count)
+                    : l.collectionDetailBookCount(count),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+                fontSize: 10 * coverGridTextScale(context)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Grid author tile (circular avatar + name + book count)
+// ═══════════════════════════════════════════════════════════════
+class GridAuthorTile extends StatelessWidget {
+  final Map<String, dynamic> author;
+  final bool selectionMode;
+  final bool isSelected;
+  final bool isMatching;
+  final VoidCallback? onSelectionToggle;
+  const GridAuthorTile({
+    super.key,
+    required this.author,
+    this.selectionMode = false,
+    this.isSelected = false,
+    this.isMatching = false,
+    this.onSelectionToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final auth = context.read<AuthProvider>();
+    final lib = context.read<LibraryProvider>();
+
+    final name = author['name'] as String? ?? l.unknown;
+    final authorId = author['id'] as String? ?? '';
+    final numBooks = author['numBooks'] as int? ?? 0;
+
+    String? imageUrl;
+    // Only authors with a photo get a request: the server answers 404 for
+    // the rest, and a burst of those reads as probing to fail2ban and
+    // CrowdSec in front of it (GH #418).
+    final hasPhoto = (author['imagePath'] as String?)?.isNotEmpty == true;
+    if (authorId.isNotEmpty && hasPhoto && auth.apiService != null) {
+      final ts = (author['updatedAt'] as num?)?.toInt();
+      imageUrl = auth.apiService!.getAuthorImageUrl(authorId, updatedAt: ts);
+    }
+
+    final headers = lib.mediaHeaders;
+
+    return Semantics(
+      selected: selectionMode ? isSelected : null,
+      child: GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (selectionMode) {
+          onSelectionToggle?.call();
+          return;
+        }
+        if (authorId.isNotEmpty) {
+          showAuthorDetailSheet(context, authorId: authorId, authorName: name);
+        }
+      },
+      onLongPress: onSelectionToggle,
+      child: Column(
+        children: [
+          // Circular avatar
+          AspectRatio(
+            aspectRatio: 1,
+            child: Stack(
+              fit: StackFit.expand,
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: cs.secondaryContainer,
+                    border: selectionMode && isSelected
+                        ? Border.all(color: cs.primary, width: 3)
+                        : null,
+                  ),
+                  padding: selectionMode && isSelected
+                      ? const EdgeInsets.all(3)
+                      : EdgeInsets.zero,
+                  clipBehavior: Clip.antiAlias,
+                  child: imageUrl != null
+                      ? ClipOval(
+                          child: CoverImage(
+                            url: imageUrl,
+                            fit: BoxFit.cover,
+                            headers: headers,
+                            memCacheWidth: coverGridDecodeWidth(context),
+                            placeholder: _placeholder(cs),
+                            errorWidget: _placeholder(cs),
+                          ),
+                        )
+                      : ClipOval(child: _placeholder(cs)),
+                ),
+                if (selectionMode)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: isSelected ? cs.primary : cs.surfaceContainerHighest,
+                        border: Border.all(
+                          color: isSelected ? cs.primary : cs.outlineVariant,
+                        ),
+                      ),
+                      child: Icon(
+                        isSelected ? Icons.check_rounded : Icons.circle_outlined,
+                        size: 18,
+                        color: isSelected ? cs.onPrimary : cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                if (numBooks > 0)
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: cs.primaryContainer,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.auto_stories_rounded, size: 11, color: cs.onPrimaryContainer),
+                          const SizedBox(width: 3),
+                          Text('$numBooks',
+                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
+                              color: cs.onPrimaryContainer)),
+                        ],
+                      ),
+                    ),
+                  ),
+                if (isMatching)
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.black.withValues(alpha: 0.55),
+                      ),
+                      child: const Center(
+                        child: SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            name,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: tt.labelSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: cs.onSurface,
+              fontSize: 11 * coverGridTextScale(context),
+            ),
+          ),
+        ],
+      ),
+      ),
+    );
+  }
+
+  Widget _placeholder(ColorScheme cs) {
+    return Center(
+      child: Icon(Icons.person_rounded,
+          size: 32, color: cs.onSecondaryContainer.withValues(alpha: 0.4)),
+    );
+  }
+}
+
+/// Long-press menu for a library series: exclude it from (or re-include it
+/// in) the Scan Series feature.
+Future<void> showSeriesScanMenu(
+    BuildContext context, String seriesId, String seriesName) async {
+  final excluded = await UpcomingReleasesService.isNeverScan(seriesId);
+  if (!context.mounted) return;
+  final l = AppLocalizations.of(context)!;
+  final cs = Theme.of(context).colorScheme;
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: Theme.of(context).bottomSheetTheme.backgroundColor,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+    ),
+    builder: (ctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Center(child: Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 8, bottom: 12),
+          decoration: BoxDecoration(color: cs.onSurface.withValues(alpha: 0.24), borderRadius: BorderRadius.circular(2)))),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Text(seriesName,
+            style: Theme.of(ctx).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+            maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center),
+        ),
+        const SizedBox(height: 12),
+        ListTile(
+          leading: Icon(excluded ? Icons.visibility_rounded : Icons.visibility_off_rounded,
+            color: cs.primary, size: 22),
+          title: Text(excluded ? l.seriesIncludeInScan : l.seriesExcludeFromScan,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+          dense: true, visualDensity: VisualDensity.compact,
+          onTap: () {
+            Navigator.pop(ctx);
+            UpcomingReleasesService.setNeverScan(seriesId, !excluded);
+          },
+        ),
+        const SizedBox(height: 8),
+      ]),
+    ),
+  );
+}
+

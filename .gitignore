@@ -1,0 +1,104 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+
+# Captured logcat / diagnostic dumps (never commit)
+/drive_*.txt
+/overnight_*.txt
+/podcast_sync_test.txt
+/absorb_logs_share_*.txt
+/*_logcat.txt
+/*_cpu.txt
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# DevTools
+devtools_options.yaml
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+android/key.properties
+*.jks
+
+# Build scripts (local only)
+*.sh
+
+# Tests (local only)
+/test/
+
+# Battery profiling output
+/battery-reports/
+
+# Flutter example build artifacts (vendored packages under packages/)
+**/android/app/src/main/java/io/
+**/android/local.properties
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/ephemeral/
+**/ios/Runner/GeneratedPluginRegistrant.h
+**/ios/Runner/GeneratedPluginRegistrant.m
+**/macos/Flutter/GeneratedPluginRegistrant.swift
+**/macos/Flutter/ephemeral/
+packages/audio_service/pubspec.lock
+packages/audio_service/example/pubspec.lock
+
+# Native build intermediates Gradle writes inside vendored plugins
+packages/*/android/.cxx/
+packages/*/android_compat/.cxx/
+packages/*/android_compat/build/
+packages/whisper_ggml_plus/pubspec.lock
+
+# Kotlin build session caches
+**/android/.kotlin/
+
+# Gradle / Android build outputs (fork)
+/android/.gradle/
+/android/build/
+/android/app/build/
+packages/*/android/.gradle/
+packages/*/android/build/
+packages/*/android_compat/build/
+*.apk
+*.aab
+*.ipa
+
+# Local scratch / editor backups (fork)
+/l10n_work/
+*.bak

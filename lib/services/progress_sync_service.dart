@@ -1,0 +1,768 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'api_service.dart';
+import 'scoped_prefs.dart';
+import 'sync_logic.dart';
+
+/// Manages local progress storage and server sync.
+/// Progress is ALWAYS saved locally first, then synced to server when online.
+/// All progress data is scoped to the active user account via ScopedPrefs.
+class ProgressSyncService {
+  static final ProgressSyncService _instance = ProgressSyncService._();
+  factory ProgressSyncService() => _instance;
+  ProgressSyncService._();
+
+  StreamSubscription? _connectivitySub;
+  bool _isOnline = true;
+  bool _isFlushing = false;
+  bool _flushAgain = false;
+  Completer<void>? _flushCompleter;
+  bool _isFlushingOfflineListening = false;
+  int _consecutiveFailures = 0;
+  static const _maxConsecutiveFailures = 10;
+
+  /// Initialize — start listening for connectivity changes.
+  Future<void> init() async {
+    final result = await Connectivity().checkConnectivity();
+    _isOnline = !result.contains(ConnectivityResult.none);
+
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((result) {
+      final wasOffline = !_isOnline;
+      _isOnline = !result.contains(ConnectivityResult.none);
+      if (_isOnline && wasOffline) {
+        _consecutiveFailures = 0; // reset backoff on connectivity change
+        flushPendingSync();
+      }
+    });
+  }
+
+  bool get isOnline => _isOnline;
+
+  /// Save progress locally and mark it as a pending change to sync.
+  Future<void> saveLocal({
+    required String itemId,
+    required double currentTime,
+    required double duration,
+    required double speed,
+    bool? isFinished,
+  }) async {
+    final existing = await getLocal(itemId);
+    // Preserve existing isFinished flag if not explicitly provided
+    isFinished ??= existing?['isFinished'] as bool? ?? false;
+    // Tripwire for the progress-loss family: a save that moves an item
+    // backward by minutes is almost always a bug upstream, not listening.
+    final previous = (existing?['currentTime'] as num?)?.toDouble();
+    if (previous != null && previous - currentTime > 300) {
+      debugPrint(
+        '[ProgressDiag] $itemId local save drops '
+        '${previous.toStringAsFixed(1)}s -> ${currentTime.toStringAsFixed(1)}s',
+      );
+    }
+    final data = {
+      'itemId': itemId,
+      'currentTime': currentTime,
+      'duration': duration,
+      'speed': speed,
+      'isFinished': isFinished,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+    await ScopedPrefs.setString('progress_$itemId', jsonEncode(data));
+
+    final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+    if (!pendingList.contains(itemId)) {
+      pendingList.add(itemId);
+      await ScopedPrefs.setStringList('pending_syncs', pendingList);
+    }
+  }
+
+  /// Cache server-known progress locally without marking it as a pending sync.
+  /// Skips items with a pending sync so unsynced local writes (e.g. a finished
+  /// state saved while offline) are not clobbered by a stale server snapshot.
+  /// Returns true if the cache was written, false if it was refused.
+  ///
+  /// [overridePending] is for the flush itself: it has just compared the
+  /// pending entry against a fresh server read and decided the server wins,
+  /// so the guard would only be refusing the very entry being resolved.
+  Future<bool> cacheServerProgress({
+    required String itemId,
+    required double currentTime,
+    required double duration,
+    bool isFinished = false,
+    bool overridePending = false,
+  }) async {
+    final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+    if (!overridePending && pendingList.contains(itemId)) {
+      debugPrint('[Sync] Skipping server cache for $itemId - pending local sync would be clobbered (isFinished=$isFinished)');
+      return false;
+    }
+    final data = {
+      'itemId': itemId,
+      'currentTime': currentTime,
+      'duration': duration,
+      'speed': 1.0,
+      'isFinished': isFinished,
+      'timestamp': 0,
+    };
+    await ScopedPrefs.setString('progress_$itemId', jsonEncode(data));
+    return true;
+  }
+
+  /// Get locally saved progress for an item.
+  Future<Map<String, dynamic>?> getLocal(String itemId) async {
+    final json = await ScopedPrefs.getString('progress_$itemId');
+    if (json == null) return null;
+    try {
+      return jsonDecode(json) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Get the saved currentTime for an item (for resuming).
+  Future<double> getSavedPosition(String itemId) async {
+    final data = await getLocal(itemId);
+    return (data?['currentTime'] as num?)?.toDouble() ?? 0;
+  }
+
+  /// Get the saved timestamp (milliseconds since epoch) for an item.
+  Future<int> getSavedTimestamp(String itemId) async {
+    final data = await getLocal(itemId);
+    return (data?['timestamp'] as num?)?.toInt() ?? 0;
+  }
+
+  /// Whether the given item has unsynced local progress. Callers can use this
+  /// to avoid clobbering offline-listening progress with a stale server snapshot.
+  Future<bool> hasPendingSync(String itemId) async {
+    final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+    return pendingList.contains(itemId);
+  }
+
+  /// Delete locally saved progress for an item.
+  Future<void> deleteLocal(String itemId) async {
+    await ScopedPrefs.remove('progress_$itemId');
+    final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+    pendingList.remove(itemId);
+    await ScopedPrefs.setStringList('pending_syncs', pendingList);
+  }
+
+  /// The duration sent with a progress write becomes the divisor for the
+  /// server's percentage, so a bad local duration corrupts the displayed
+  /// percent forever even while currentTime stays right (abs issue #5468).
+  /// Prefer the item's own server-side duration whenever it can be fetched.
+  final Map<String, double> _serverDurationCache = {};
+
+  Future<double> serverTrustedDuration(
+      ApiService api, String itemId, double localDuration) async {
+    final cached = _serverDurationCache[itemId];
+    if (cached != null) return cached;
+    final isCompound = itemId.length > 36;
+    final apiItemId = isCompound ? itemId.substring(0, 36) : itemId;
+    final episodeId = isCompound ? itemId.substring(37) : null;
+    try {
+      final item = await api.getLibraryItem(apiItemId);
+      final media = item?['media'] as Map<String, dynamic>?;
+      double serverDur = 0;
+      if (episodeId != null) {
+        for (final e in (media?['episodes'] as List<dynamic>? ?? const [])) {
+          if (e is Map<String, dynamic> && e['id'] == episodeId) {
+            serverDur = (e['duration'] as num?)?.toDouble() ?? 0;
+            break;
+          }
+        }
+      } else {
+        serverDur = (media?['duration'] as num?)?.toDouble() ?? 0;
+      }
+      if (serverDur > 0) {
+        if ((serverDur - localDuration).abs() > 1) {
+          debugPrint('[Sync] $itemId: using server duration '
+              '${serverDur.toStringAsFixed(0)}s over local '
+              '${localDuration.toStringAsFixed(0)}s');
+        }
+        _serverDurationCache[itemId] = serverDur;
+        return serverDur;
+      }
+    } catch (_) {}
+    return localDuration;
+  }
+
+  /// Sync a single item to the server. Returns true if synced.
+  Future<bool> syncToServer({
+    required ApiService api,
+    required String itemId,
+    String? sessionId,
+  }) async {
+    if (!_isOnline) {
+      debugPrint('[Sync] Skipped — offline');
+      return false;
+    }
+
+    final data = await getLocal(itemId);
+    if (data == null) {
+      debugPrint('[Sync] Skipped — no local data for $itemId');
+      return false;
+    }
+
+    final currentTime = (data['currentTime'] as num?)?.toDouble() ?? 0;
+    final duration = (data['duration'] as num?)?.toDouble() ?? 0;
+    final isFinished = data['isFinished'] as bool? ?? false;
+    debugPrint('[Sync] Syncing $itemId: currentTime=$currentTime, duration=$duration, isFinished=$isFinished, sessionId=$sessionId');
+
+    try {
+      if (sessionId != null) {
+        await api.syncPlaybackSession(
+          sessionId,
+          currentTime: currentTime,
+          duration: duration,
+        );
+      } else {
+        final ok = await api.updateProgress(
+          itemId,
+          currentTime: currentTime,
+          duration: await serverTrustedDuration(api, itemId, duration),
+          isFinished: isFinished ? true : null,
+        );
+        if (!ok) {
+          debugPrint('[Sync] Server did not take $itemId - keeping it pending');
+          return false;
+        }
+      }
+
+      final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+      pendingList.remove(itemId);
+      await ScopedPrefs.setStringList('pending_syncs', pendingList);
+
+      debugPrint('[Sync] Synced $itemId: ${currentTime}s');
+      return true;
+    } catch (e) {
+      debugPrint('[Sync] Failed for $itemId: $e');
+      return false;
+    }
+  }
+
+  /// Flush all pending syncs (call when coming back online).
+  /// Compares local vs server timestamps — last-write-wins.
+  Future<void> flushPendingSync({ApiService? api, int maxItems = 5}) async {
+    if (!_isOnline || api == null) return;
+
+    if (_isFlushing) {
+      _flushAgain = true;
+      final activeFlush = _flushCompleter;
+      if (activeFlush != null) await activeFlush.future;
+      return;
+    }
+
+    _isFlushing = true;
+    final flushCompleter = Completer<void>();
+    _flushCompleter = flushCompleter;
+    var pendingAtStart = 0;
+    try {
+      final pendingList = List<String>.from(
+          await ScopedPrefs.getStringList('pending_syncs'));
+
+      if (pendingList.isEmpty) {
+        // Nothing to listen-sync, but reading and offline listening time
+        // still wait on this flush; returning here left them queued and the
+        // retry below rescheduling for nothing.
+        await _flushOfflineListeningTimeInternal(api: api);
+        await _flushPendingEbookProgress(api);
+        return;
+      }
+      pendingAtStart = pendingList.length;
+
+      final batch = pendingList.take(maxItems).toList();
+      debugPrint('[Sync] Flushing ${batch.length}/${pendingList.length} pending syncs');
+
+      for (final itemId in batch) {
+        final data = await getLocal(itemId);
+        if (data == null) {
+          final updated = await ScopedPrefs.getStringList('pending_syncs');
+          updated.remove(itemId);
+          await ScopedPrefs.setStringList('pending_syncs', updated);
+          continue;
+        }
+
+        final localTime = (data['currentTime'] as num?)?.toDouble() ?? 0;
+        final localDuration = (data['duration'] as num?)?.toDouble() ?? 0;
+        final localTimestamp = (data['timestamp'] as num?)?.toInt() ?? 0;
+        if (localTime <= 0) {
+          final updated = await ScopedPrefs.getStringList('pending_syncs');
+          updated.remove(itemId);
+          await ScopedPrefs.setStringList('pending_syncs', updated);
+          continue;
+        }
+
+        try {
+          final serverProgress = await api.getItemProgress(itemId);
+          if (serverProgress != null) {
+            final serverTimestamp = (serverProgress['lastUpdate'] as num?)?.toInt() ?? 0;
+            final serverTime = (serverProgress['currentTime'] as num?)?.toDouble() ?? 0;
+
+            // Check if there's pending offline listening time for this item.
+            // If so, the server doesn't have the full picture yet - always
+            // push local to avoid overwriting progress with a stale position.
+            final hasOfflineListening =
+                (await ScopedPrefs.getInt('offline_listening_$itemId') ?? 0) > 0;
+
+            if (SyncLogic.shouldPullServer(
+              serverTimestamp: serverTimestamp,
+              serverTime: serverTime,
+              localTimestamp: localTimestamp,
+              localTime: localTime,
+              hasOfflineListening: hasOfflineListening,
+            )) {
+              debugPrint('[Sync] Server is newer for $itemId: server=$serverTime s ($serverTimestamp) vs local=$localTime s ($localTimestamp) — pulling');
+              // The player may have saved again while the server read was in
+              // flight. Then the entry we compared is gone: leave it pending
+              // and let the next flush compare the new one, which will push.
+              final latest = await getLocal(itemId);
+              final latestTimestamp =
+                  (latest?['timestamp'] as num?)?.toInt() ?? 0;
+              if (latestTimestamp != localTimestamp) {
+                debugPrint('[Sync] Local changed during the pull for $itemId - comparing again on the next flush');
+                continue;
+              }
+              // This entry lost to the server, so it is no longer worth
+              // protecting: replace it and clear it from pending. Refusing the
+              // write here (as the clobber guard used to) and keeping the
+              // entry pending retried every 250ms forever - hundreds of
+              // server reads a minute, and the other device's newer position
+              // never landed.
+              await cacheServerProgress(
+                itemId: itemId,
+                currentTime: serverTime,
+                duration: localDuration,
+                isFinished: serverProgress['isFinished'] as bool? ?? false,
+                overridePending: true,
+              );
+              final updated = await ScopedPrefs.getStringList('pending_syncs');
+              updated.remove(itemId);
+              await ScopedPrefs.setStringList('pending_syncs', updated);
+              if (_consecutiveFailures > 0) {
+                debugPrint('[Sync] Backoff reset (was $_consecutiveFailures)');
+                _consecutiveFailures = 0;
+              }
+              continue;
+            }
+            debugPrint('[Sync] Local is newer for $itemId: local=$localTime s ($localTimestamp) vs server=$serverTime s ($serverTimestamp) — pushing');
+          }
+
+          // Use the direct progress endpoint instead of creating a new
+          // playback session.  Creating a session can invalidate the
+          // player's active session on the server, causing subsequent
+          // in-playback syncs to silently fail.
+          final isCompound = itemId.length > 36;
+          final apiItemId = isCompound ? itemId.substring(0, 36) : itemId;
+          final episodeId = isCompound ? itemId.substring(37) : null;
+
+          final localFinished = data['isFinished'] as bool? ?? false;
+          final syncDuration =
+              await serverTrustedDuration(api, itemId, localDuration);
+          final bool pushed;
+          if (episodeId != null) {
+            pushed = await api.updateEpisodeProgress(
+              apiItemId, episodeId,
+              currentTime: localTime,
+              duration: syncDuration,
+              isFinished: localFinished ? true : null,
+            );
+          } else {
+            pushed = await api.updateProgress(
+              apiItemId,
+              currentTime: localTime,
+              duration: syncDuration,
+              isFinished: localFinished ? true : null,
+            );
+          }
+          if (!pushed) {
+            // Dropping it as flushed is how a refused push lost a position
+            // overnight: the next start resumed from the stale spot.
+            debugPrint('[Sync] Push for $itemId did not reach the server - keeping it for the next flush');
+            _consecutiveFailures++;
+            break;
+          }
+          debugPrint('[Sync] Flushed $itemId via progress update: ${localTime}s');
+          // Reset backoff on success - a successful response proves
+          // the server is reachable, so resume normal sync behaviour.
+          if (_consecutiveFailures > 0) {
+            debugPrint('[Sync] Backoff reset (was $_consecutiveFailures)');
+            _consecutiveFailures = 0;
+          }
+
+          final updated = await ScopedPrefs.getStringList('pending_syncs');
+          updated.remove(itemId);
+          await ScopedPrefs.setStringList('pending_syncs', updated);
+        } catch (e) {
+          debugPrint('[Sync] Flush failed for $itemId: $e');
+          // Stop the batch on any network/TLS error - don't keep hammering
+          final msg = e.toString();
+          if (msg.contains('SocketException') ||
+              msg.contains('connection abort') ||
+              msg.contains('HandshakeException') ||
+              msg.contains('CERTIFICATE_VERIFY_FAILED') ||
+              msg.contains('Connection refused') ||
+              msg.contains('Connection reset') ||
+              msg.contains('timed out') ||
+              msg.contains('TimeoutException') ||
+              msg.contains('Network is unreachable')) {
+            debugPrint('[Sync] Network/TLS error - stopping flush');
+            _consecutiveFailures++;
+            break;
+          }
+        }
+      }
+      // Also flush offline listening time and queued ebook positions while
+      // we have a connection
+      if (_consecutiveFailures == 0) {
+        await _flushOfflineListeningTimeInternal(api: api);
+        await _flushPendingEbookProgress(api);
+      }
+    } finally {
+      _isFlushing = false;
+      if (!flushCompleter.isCompleted) flushCompleter.complete();
+      if (identical(_flushCompleter, flushCompleter)) {
+        _flushCompleter = null;
+      }
+    }
+
+    final remaining = await ScopedPrefs.getStringList('pending_syncs');
+    final pendingOffline = await ScopedPrefs.getStringList('pending_offline_listening');
+    final pendingEbook = await getPendingEbookProgress();
+    if ((_flushAgain || remaining.isNotEmpty || pendingOffline.isNotEmpty || pendingEbook.isNotEmpty) && _isOnline) {
+      _flushAgain = false;
+
+      // A flush that cleared nothing without a network error is stuck on
+      // something the next attempt will hit again (a server error, an entry
+      // that keeps losing the comparison). The 250ms fast retry is for
+      // finishing a partial batch, not for that - count it as a failure so
+      // the backoff below applies instead of hammering the server.
+      if (_consecutiveFailures == 0 &&
+          pendingAtStart > 0 &&
+          remaining.length >= pendingAtStart) {
+        _consecutiveFailures++;
+        debugPrint('[Sync] Flush made no progress (${remaining.length} still pending) - backing off');
+      }
+      // Exponential backoff: 5s, 10s, 20s, 40s, ... capped at 5 minutes
+      if (_consecutiveFailures >= _maxConsecutiveFailures) {
+        debugPrint('[Sync] Too many consecutive failures ($_consecutiveFailures) - waiting for next connectivity change');
+        return;
+      }
+      final clampedDelay = SyncLogic.backoffDelay(_consecutiveFailures);
+      debugPrint('[Sync] Scheduling retry in ${clampedDelay.inSeconds}s (failures=$_consecutiveFailures)');
+
+      unawaited(
+        Future<void>.delayed(clampedDelay, () {
+          return flushPendingSync(api: api, maxItems: maxItems);
+        }),
+      );
+    } else {
+      _flushAgain = false;
+    }
+  }
+
+  // ── Ebook reading progress (durable offline queue) ──
+
+  /// Push an ebook position to the server. A failed PATCH is persisted
+  /// (newest position per item) and retried by flushPendingSync when
+  /// connectivity returns, so pages read offline survive an app restart.
+  Future<void> pushEbookProgress(
+    ApiService api,
+    String itemId, {
+    required String location,
+    required double progress,
+  }) async {
+    final ok = _isOnline &&
+        await api.updateEbookProgress(itemId,
+            ebookLocation: location, ebookProgress: progress);
+    if (ok) {
+      await _removePendingEbook(itemId);
+      return;
+    }
+    if (_isOnline && api.lastEbookProgressStatus == 404) {
+      debugPrint('[Sync] Not queueing the ebook position for $itemId: the server has no such book');
+      await _removePendingEbook(itemId);
+      return;
+    }
+    final pending = await getPendingEbookProgress();
+    pending[itemId] = {
+      'loc': location,
+      'prog': progress,
+      'ts': DateTime.now().millisecondsSinceEpoch,
+    };
+    await ScopedPrefs.setString('pending_ebook_progress', jsonEncode(pending));
+    debugPrint('[Sync] Queued ebook progress for $itemId (offline or PATCH failed)');
+  }
+
+  /// Queued ebook positions whose PATCH hasn't landed yet
+  /// (itemId -> {loc, prog, ts}).
+  Future<Map<String, Map<String, dynamic>>> getPendingEbookProgress() async {
+    final raw = await ScopedPrefs.getString('pending_ebook_progress');
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      return map.map((k, v) => MapEntry(k, Map<String, dynamic>.from(v as Map)));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Forget a queued position the server has since moved past, so the retry
+  /// can't put the older place back.
+  Future<void> dropPendingEbookProgress(String itemId) => _removePendingEbook(itemId);
+
+  Future<void> _removePendingEbook(String itemId) async {
+    final pending = await getPendingEbookProgress();
+    if (pending.remove(itemId) == null) return;
+    await ScopedPrefs.setString('pending_ebook_progress', jsonEncode(pending));
+  }
+
+  Future<void> _flushPendingEbookProgress(ApiService api) async {
+    final pending = await getPendingEbookProgress();
+    if (pending.isEmpty) return;
+    debugPrint('[Sync] Flushing ${pending.length} pending ebook positions');
+    for (final entry in pending.entries) {
+      final loc = entry.value['loc'] as String?;
+      final prog = (entry.value['prog'] as num?)?.toDouble();
+      if (loc == null || prog == null) {
+        await _removePendingEbook(entry.key);
+        continue;
+      }
+      final ok = await api.updateEbookProgress(entry.key,
+          ebookLocation: loc, ebookProgress: prog);
+      if (ok) {
+        await _removePendingEbook(entry.key);
+        _consecutiveFailures = 0;
+      } else if (api.lastEbookProgressStatus == 404) {
+        // Another server's download read here, or a book since deleted: this
+        // server will never take it, and retrying held up the rest.
+        debugPrint('[Sync] Dropping the queued ebook position for ${entry.key}: the server has no such book');
+        await _removePendingEbook(entry.key);
+      } else {
+        // Server unreachable - let the existing backoff schedule the retry.
+        _consecutiveFailures++;
+        break;
+      }
+    }
+  }
+
+  // ── Offline listening time tracking ──
+
+  /// Add listening time for an item that was played offline.
+  Future<void> addOfflineListeningTime(String itemId, int seconds) async {
+    if (seconds <= 0) return;
+    final key = 'offline_listening_$itemId';
+    final existing = await ScopedPrefs.getInt(key) ?? 0;
+    await ScopedPrefs.setInt(key, existing + seconds);
+    debugPrint('[Sync] Offline listening +${seconds}s for $itemId (total=${existing + seconds}s)');
+
+    // Track which items have pending offline time
+    final pending = await ScopedPrefs.getStringList('pending_offline_listening');
+    if (!pending.contains(itemId)) {
+      pending.add(itemId);
+      await ScopedPrefs.setStringList('pending_offline_listening', pending);
+    }
+  }
+
+  /// Buffer listening time for an item that is streaming with a live server
+  /// session. This is a durable safety net only: the live session sync is what
+  /// reports the time, and [reduceStreamingPendingTime] clears the buffer once
+  /// a sync confirms. Whatever survives a kill is shipped by
+  /// [migrateOrphanStreamingTime] on the next launch, so the most that can be
+  /// lost is one accrual tick.
+  Future<void> addStreamingPendingTime(String itemId, int seconds) async {
+    if (seconds <= 0) return;
+    final key = 'streaming_pending_$itemId';
+    final existing = await ScopedPrefs.getInt(key) ?? 0;
+    await ScopedPrefs.setInt(key, existing + seconds);
+    final pending = await ScopedPrefs.getStringList('pending_streaming_listening');
+    if (!pending.contains(itemId)) {
+      pending.add(itemId);
+      await ScopedPrefs.setStringList('pending_streaming_listening', pending);
+    }
+  }
+
+  Future<int> getStreamingPendingTime(String itemId) async =>
+      await ScopedPrefs.getInt('streaming_pending_$itemId') ?? 0;
+
+  /// Clear [seconds] from the streaming safety buffer after a sync confirmed
+  /// that much listening reached the server. Anything accrued during the
+  /// in-flight sync is left for the next round.
+  Future<void> reduceStreamingPendingTime(String itemId, int seconds) async {
+    if (seconds <= 0) return;
+    final key = 'streaming_pending_$itemId';
+    final cur = await ScopedPrefs.getInt(key) ?? 0;
+    final next = cur - seconds;
+    if (next > 0) {
+      await ScopedPrefs.setInt(key, next);
+    } else {
+      await ScopedPrefs.remove(key);
+      final pending =
+          List<String>.from(await ScopedPrefs.getStringList('pending_streaming_listening'));
+      pending.remove(itemId);
+      await ScopedPrefs.setStringList('pending_streaming_listening', pending);
+    }
+  }
+
+  /// On launch, a non-empty streaming buffer means a stream was killed before
+  /// its last span synced. Move it into the offline ledger so the normal flush
+  /// ships it (via a fresh session). Run once at startup before playback opens
+  /// any new streaming session.
+  Future<void> migrateOrphanStreamingTime() async {
+    final pending = List<String>.from(
+        await ScopedPrefs.getStringList('pending_streaming_listening'));
+    if (pending.isEmpty) return;
+    for (final itemId in pending) {
+      final key = 'streaming_pending_$itemId';
+      final secs = await ScopedPrefs.getInt(key) ?? 0;
+      if (secs > 0) await addOfflineListeningTime(itemId, secs);
+      await ScopedPrefs.remove(key);
+    }
+    await ScopedPrefs.setStringList('pending_streaming_listening', []);
+  }
+
+  /// Bank time saved by playback speed: [elapsedSeconds] of wall-clock
+  /// listening at [speed]. Exact even with constant speed changes because it
+  /// samples whatever speed is live each time listening accrues. Stored
+  /// per-account; shown on the stats page.
+  Future<void> addTimeSaved(int elapsedSeconds, double speed) async {
+    if (elapsedSeconds <= 0 || (speed - 1.0).abs() < 0.01) return;
+    final saved = elapsedSeconds * (speed - 1.0);
+    final current = await ScopedPrefs.getDouble('stats_time_saved') ?? 0.0;
+    await ScopedPrefs.setDouble('stats_time_saved', current + saved);
+    if (await ScopedPrefs.getInt('stats_time_saved_since') == null) {
+      await ScopedPrefs.setInt(
+          'stats_time_saved_since', DateTime.now().millisecondsSinceEpoch);
+    }
+  }
+
+  /// Flush accumulated offline listening time to the server by creating
+  /// a session, syncing the accumulated time, and closing it.
+  /// Called externally (e.g. from library_provider) and also internally
+  /// from flushPendingSync's retry loop.
+  Future<void> flushOfflineListeningTime({required ApiService api}) async {
+    if (!_isOnline) return;
+    await _flushOfflineListeningTimeInternal(api: api);
+  }
+
+  Future<void> _flushOfflineListeningTimeInternal({required ApiService api}) async {
+    // Guard against concurrent runs. Without this, "back online" triggers
+    // both the external flushOfflineListeningTime and flushPendingSync's
+    // internal tail-call to this method, producing duplicate listening
+    // sessions on the server.
+    if (_isFlushingOfflineListening) return;
+    _isFlushingOfflineListening = true;
+    try {
+      final pending = List<String>.from(
+          await ScopedPrefs.getStringList('pending_offline_listening'));
+      if (pending.isEmpty) return;
+      final flushed = <String>{};
+
+      debugPrint('[Sync] Flushing offline listening time for ${pending.length} item(s)');
+
+      for (final itemId in pending) {
+        final key = 'offline_listening_$itemId';
+        final seconds = await ScopedPrefs.getInt(key) ?? 0;
+        if (seconds <= 0) {
+          await ScopedPrefs.remove(key);
+          flushed.add(itemId);
+          continue;
+        }
+
+        final data = await getLocal(itemId);
+        var currentTime = (data?['currentTime'] as num?)?.toDouble() ?? 0;
+        final duration = (data?['duration'] as num?)?.toDouble() ?? 0;
+
+        // The session opened below carries a position, and the server writes
+        // that position into progress. This ledger entry can be hours older
+        // than the server's own position (another device, or this one, carried
+        // on listening since), so report the time at whichever position is
+        // further in. Crediting listening must never drag progress backwards.
+        try {
+          final serverProgress = await api.getItemProgress(itemId);
+          final serverTime =
+              (serverProgress?['currentTime'] as num?)?.toDouble() ?? 0;
+          if (serverTime > currentTime) {
+            debugPrint(
+                '[Sync] Server is ahead for $itemId (${serverTime}s vs ${currentTime}s) - reporting listening at the server position');
+            currentTime = serverTime;
+          }
+        } catch (e) {
+          debugPrint('[Sync] Could not read server progress for $itemId: $e');
+        }
+
+        // A ledger holding more listening than the item is long is not a real
+        // backlog, it is an accrual that ran away - a player that reported
+        // playing while its position stood still. Report what is plausible and
+        // say what was dropped rather than writing fiction into the stats.
+        var reported = seconds;
+        if (duration > 0 && reported > duration) {
+          debugPrint(
+              '[Sync] Offline listening for $itemId holds ${seconds}s but the item is only ${duration.round()}s - reporting ${duration.round()}s and dropping the rest');
+          reported = duration.round();
+        }
+
+        try {
+          final isCompound = itemId.length > 36;
+          final apiItemId = isCompound ? itemId.substring(0, 36) : itemId;
+          final episodeId = isCompound ? itemId.substring(37) : null;
+
+          final sessionData = episodeId != null
+              ? await api.startEpisodePlaybackSession(apiItemId, episodeId)
+              : await api.startPlaybackSession(apiItemId);
+
+          if (sessionData != null) {
+            final sid = sessionData['id'] as String?;
+            if (sid != null) {
+              await api.syncPlaybackSession(
+                sid,
+                currentTime: currentTime,
+                duration: duration,
+                timeListened: reported,
+              );
+              await api.closePlaybackSession(sid);
+              debugPrint('[Sync] Flushed ${reported}s offline listening for $itemId');
+            }
+          }
+          // Subtract only what we actually synced. Any ticks added to the
+          // key during the flush (e.g. a +60s tick that fired while the
+          // server session was in flight) are preserved for the next run
+          // instead of being wiped by an outright remove.
+          final current = await ScopedPrefs.getInt(key) ?? 0;
+          final remaining = current - seconds;
+          if (remaining > 0) {
+            await ScopedPrefs.setInt(key, remaining);
+          } else {
+            await ScopedPrefs.remove(key);
+            flushed.add(itemId);
+          }
+        } catch (e) {
+          debugPrint('[Sync] Failed to flush offline listening for $itemId: $e');
+          final msg = e.toString();
+          if (msg.contains('SocketException') ||
+              msg.contains('TimeoutException') ||
+              msg.contains('timed out') ||
+              msg.contains('Connection refused') ||
+              msg.contains('Network is unreachable')) {
+            _consecutiveFailures++;
+            break;
+          }
+        }
+      }
+
+      // Only remove successfully flushed items from pending list
+      if (flushed.isNotEmpty) {
+        final remaining = List<String>.from(
+            await ScopedPrefs.getStringList('pending_offline_listening'));
+        remaining.removeWhere((id) => flushed.contains(id));
+        await ScopedPrefs.setStringList('pending_offline_listening', remaining);
+      }
+    } finally {
+      _isFlushingOfflineListening = false;
+    }
+  }
+
+  void dispose() {
+    _connectivitySub?.cancel();
+  }
+}

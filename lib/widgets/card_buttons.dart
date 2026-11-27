@@ -1,0 +1,2853 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import '../l10n/app_localizations.dart';
+import '../services/wording.dart';
+import '../providers/auth_provider.dart';
+import '../providers/library_provider.dart';
+import '../screens/app_shell.dart';
+import '../screens/car_mode_screen.dart';
+import '../screens/stats_screen.dart';
+import '../services/api_service.dart';
+import '../services/audio_player_service.dart';
+import '../services/bookmark_service.dart';
+import '../services/chromecast_service.dart';
+import '../services/download_service.dart';
+import '../services/lyrics_service.dart';
+import '../services/transcription_service.dart';
+import '../services/equalizer_service.dart';
+import '../services/playback_history_service.dart';
+import '../services/narrated_books.dart';
+import '../services/scoped_prefs.dart';
+import '../services/screen_wake.dart';
+import '../services/sleep_timer_service.dart';
+import '../utils/episode_key.dart';
+import 'absorb_slider.dart';
+import 'absorbing_shared.dart';
+import 'book_detail_sheet.dart';
+import 'bookmark_detail_dialog.dart';
+import 'card_button_config.dart';
+import 'card_chapters_sheet.dart';
+import 'chromecast_button.dart';
+import 'episode_detail_sheet.dart';
+import 'episode_list_sheet.dart';
+import 'equalizer_sheet.dart';
+import 'feature_hint.dart';
+import 'listening_session_card.dart';
+import 'notes_sheet.dart';
+import 'overlay_toast.dart';
+import 'sleep_timer_sheet.dart';
+import 'transcription_download_prompt.dart';
+
+/// E-ink screens dither faint greys and cover-colored accents into noise, so
+/// the card controls bump to near-black when e-ink mode is on. Disabled stays
+/// visibly lighter than enabled, just dark enough to survive the panel.
+Color _inkAccent(Color accent) =>
+    PlayerSettings.einkMode ? Colors.black : accent;
+double _inkAlpha(double normal, double eink) =>
+    PlayerSettings.einkMode ? eink : normal;
+
+/// A card button's fill under the Button background setting. Subtle is the
+/// tint at the given strength; Solid lays it over an opaque surface.
+Color _buttonFill(ColorScheme cs, Color tint, double normal, double eink, {bool neutral = false}) =>
+    switch (PlayerSettings.cardButtonFill) {
+      'clear' => Colors.transparent,
+      'solid' => neutral
+          ? cs.surfaceContainerHighest
+          : Color.alphaBlend(tint.withValues(alpha: 0.2), cs.surfaceContainerHighest),
+      _ => tint.withValues(alpha: _inkAlpha(normal, eink)),
+    };
+
+/// A card button's edge; Clear drops it with the fill.
+Color _buttonEdge(Color tint, double normal, double eink) =>
+    PlayerSettings.cardButtonFill == 'clear' ? Colors.transparent : tint.withValues(alpha: _inkAlpha(normal, eink));
+
+/// Wrapper that gives any child a press-down opacity+scale effect.
+class Pressable extends StatefulWidget {
+  final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
+  final HitTestBehavior? behavior;
+  final Widget child;
+  const Pressable({super.key, this.onTap, this.onLongPress, this.behavior, required this.child});
+  @override State<Pressable> createState() => _PressableState();
+}
+
+class _PressableState extends State<Pressable> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: widget.behavior,
+      onTap: widget.onTap,
+      onLongPress: widget.onLongPress,
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapUp: (_) => setState(() => _pressed = false),
+      onTapCancel: () => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? 0.90 : 1.0,
+        duration: Duration(milliseconds: _pressed ? 0 : 150),
+        child: AnimatedOpacity(
+          opacity: _pressed ? 0.4 : 1.0,
+          duration: Duration(milliseconds: _pressed ? 0 : 150),
+          child: widget.child,
+        ),
+      ),
+    );
+  }
+}
+
+/// Show a toast when the user taps a button that requires active playback.
+/// The card's Keep screen on button: holds the screen while the player is up,
+/// until the app is closed. With the Settings switch on, the button switches
+/// it off for this run only; the next launch follows Settings again.
+void toggleKeepScreenOn(BuildContext context) {
+  final l = AppLocalizations.of(context)!;
+  if (PlayerScreenWake.always) {
+    final off = !PlayerScreenWake.sessionOff.value;
+    PlayerScreenWake.sessionOff.value = off;
+    showOverlayToast(context,
+        off ? l.keepScreenOnOffUntilRestart : l.keepScreenOnUntilClosed,
+        icon: off ? Icons.lightbulb_outline_rounded : Icons.lightbulb_rounded);
+    return;
+  }
+  final on = !PlayerScreenWake.sessionOn.value;
+  PlayerScreenWake.sessionOn.value = on;
+  showOverlayToast(context, on ? l.keepScreenOnUntilClosed : l.keepScreenOnOff,
+      icon: on ? Icons.lightbulb_rounded : Icons.lightbulb_outline_rounded);
+}
+
+void showInactiveToast(BuildContext context) {
+  final l = AppLocalizations.of(context)!;
+  showOverlayToast(context, l.startPlayingSomethingFirst,
+      icon: Icons.play_disabled_rounded);
+}
+
+/// Show an error message to the user.
+void showErrorToast(BuildContext context, String message) {
+  showOverlayToast(context, message, icon: Icons.error_outline_rounded);
+}
+
+// ─── WIDE GLASS BUTTON (for 2-column grid) ─────────────────
+
+class CardWideButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color accent;
+  final bool isActive;
+  final bool alwaysEnabled;
+  final bool large;
+  final bool compact;
+  final bool iconsOnly;
+  final bool highlighted;
+  final VoidCallback? onTap;
+  final Widget? child;
+
+  const CardWideButton({
+    super.key,
+    required this.icon, required this.label,
+    required this.accent, required this.isActive,
+    this.alwaysEnabled = false, this.large = false, this.compact = false,
+    this.iconsOnly = false, this.highlighted = false, this.onTap, this.child,
+  });
+
+  @override Widget build(BuildContext context) {
+    if (child != null) return child!;
+    final cs = Theme.of(context).colorScheme;
+    final enabled = isActive || alwaysEnabled;
+    final iconSize = compact ? 13.0 : (large ? 20.0 : 16.0);
+    final fontSize = compact ? 10.0 : (large ? 13.0 : 11.0);
+    final vPad = compact ? 8.0 : (large ? 14.0 : 10.0);
+    final radius = compact ? 10.0 : (large ? 14.0 : 12.0);
+    final showIconOnly = compact || iconsOnly;
+    final fgColor = highlighted
+        ? _inkAccent(accent)
+        : (enabled
+            ? cs.onSurfaceVariant
+            : cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85)));
+    return Pressable(
+      onTap: enabled ? onTap : () => showInactiveToast(context),
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: vPad),
+        decoration: BoxDecoration(
+          color: highlighted
+              ? _buttonFill(cs, _inkAccent(accent), 0.1, 0.12)
+              : _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+          borderRadius: BorderRadius.circular(radius),
+          border: Border.all(
+              color: highlighted
+                  ? _buttonEdge(_inkAccent(accent), 0.3, 1.0)
+                  : _buttonEdge(cs.onSurface, 0.08, 0.55)),
+        ),
+        child: showIconOnly
+          ? Center(child: Icon(icon, size: iconSize, color: fgColor))
+          : Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, size: iconSize, color: fgColor),
+                const SizedBox(width: 6),
+                Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(
+                  color: fgColor,
+                  fontSize: fontSize, fontWeight: FontWeight.w500))),
+              ],
+            ),
+      ),
+    );
+  }
+}
+
+/// Menu item for the More bottom sheet
+class MoreMenuItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color accent;
+  final bool enabled;
+  // A toggle that is currently on: the pill lights up in the accent so the
+  // state shows before you press it.
+  final bool active;
+  final VoidCallback onTap;
+
+  const MoreMenuItem({
+    super.key,
+    required this.icon, required this.label,
+    required this.accent, required this.onTap,
+    this.enabled = true,
+    this.active = false,
+  });
+
+  @override Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final ink = _inkAccent(accent);
+    // Grid pill: centered icon over a short label, fills its (fixed-height)
+    // grid cell. Matches the book menu's quick-actions pills. The loose
+    // Flexible lets a long label ellipsise inside the cell at big font scales.
+    return Pressable(
+      onTap: enabled ? onTap : () => showInactiveToast(context),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+        decoration: BoxDecoration(
+          color: active ? ink.withValues(alpha: _inkAlpha(0.18, 0.0)) : cs.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: active
+                ? ink.withValues(alpha: _inkAlpha(0.6, 1.0))
+                : cs.onSurface.withValues(alpha: _inkAlpha(0.08, 0.55)),
+            width: active ? 1.5 : 1,
+          ),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.max, mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(icon, size: 22, color: enabled
+              ? ink.withValues(alpha: _inkAlpha(active ? 1.0 : 0.85, 1.0))
+              : cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85))),
+          const SizedBox(height: 7),
+          Flexible(child: Text(label, textAlign: TextAlign.center, maxLines: 2, overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: !enabled
+                  ? cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85))
+                  : active
+                      ? ink
+                      : cs.onSurface.withValues(alpha: _inkAlpha(0.85, 1.0)),
+              fontSize: 11, fontWeight: active ? FontWeight.w700 : FontWeight.w500, height: 1.15))),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Sleep button as wide card with countdown and fill bar
+class CardSleepButtonInline extends StatelessWidget {
+  final Color accent;
+  final bool isActive;
+  final bool large;
+  final bool compact;
+  final bool iconsOnly;
+  const CardSleepButtonInline({super.key, required this.accent, required this.isActive, this.large = false, this.compact = false, this.iconsOnly = false});
+
+  @override Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: SleepTimerService(),
+      builder: (_, __) {
+        final cs = Theme.of(context).colorScheme;
+        final l = AppLocalizations.of(context)!;
+        final sleep = SleepTimerService();
+        // Only show timer state on the card that's actually playing
+        final active = isActive && sleep.isActive;
+        final isTime = sleep.mode == SleepTimerMode.time;
+
+        String label;
+        if (active && isTime) {
+          final r = sleep.timeRemaining;
+          final m = r.inMinutes;
+          final s = r.inSeconds % 60;
+          label = '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+        } else if (active) {
+          label = l.chaptersLeftCount(sleep.chaptersRemaining);
+        } else {
+          label = l.timer;
+        }
+
+        final h = compact ? 30.0 : (large ? 48.0 : 36.0);
+        final iconSz = compact ? 13.0 : (large ? 20.0 : 16.0);
+        final fontSize = compact ? 10.0 : (large ? (active && isTime ? 15.0 : 14.0) : (active && isTime ? 13.0 : 12.0));
+        final radius = compact ? 10.0 : (large ? 16.0 : 14.0);
+
+        return Pressable(
+          onTap: isActive ? () {
+            showSleepTimerSheet(context, accent);
+          } : () => showInactiveToast(context),
+          child: Container(
+            height: h,
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(
+              color: active
+                  ? _buttonFill(cs, _inkAccent(accent), 0.1, 0.12)
+                  : _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(color: active
+                  ? _buttonEdge(_inkAccent(accent), 0.3, 1.0)
+                  : _buttonEdge(cs.onSurface, 0.08, 0.55)),
+            ),
+            child: Stack(children: [
+              if (active && isTime)
+                FractionallySizedBox(
+                  widthFactor: sleep.timeProgress.clamp(0.0, 1.0),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: _inkAccent(accent).withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(radius - 1),
+                    ),
+                  ),
+                ),
+              Center(child: (compact || iconsOnly) && !active
+                ? Icon(Icons.nightlight_round_outlined, size: iconSz,
+                    color: isActive ? cs.onSurfaceVariant : cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85)))
+                : iconsOnly && active
+                  ? Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(
+                      color: _inkAccent(accent),
+                      fontSize: fontSize,
+                      fontWeight: FontWeight.w700,
+                      fontFeatures: isTime ? const [FontFeature.tabularFigures()] : null,
+                    ))
+                  : Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.nightlight_round_outlined, size: iconSz,
+                        color: active ? _inkAccent(accent) : (isActive ? cs.onSurfaceVariant : cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85)))),
+                      SizedBox(width: compact ? 4 : 8),
+                      Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(
+                        color: active ? _inkAccent(accent) : (isActive ? cs.onSurfaceVariant : cs.onSurface.withValues(alpha: _inkAlpha(0.24, 0.85))),
+                        fontSize: fontSize,
+                        fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+                        fontFeatures: active && isTime ? const [FontFeature.tabularFigures()] : null,
+                      ))),
+                    ],
+                  )),
+            ]),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Download button as wide card
+class CardDownloadButtonInline extends StatelessWidget {
+  final String itemId;
+  final String? episodeId;
+  final String title;
+  final String? author;
+  final String? coverUrl;
+  final Color accent;
+  final bool large;
+  final bool compact;
+  final bool iconsOnly;
+  const CardDownloadButtonInline({super.key, required this.itemId, this.episodeId, required this.title, this.author, this.coverUrl, required this.accent, this.large = false, this.compact = false, this.iconsOnly = false});
+
+  // Podcast downloads are keyed 'parentId-episodeId'; books use the plain itemId.
+  String get _key => episodeId != null ? '$itemId-$episodeId' : itemId;
+
+  @override Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: DownloadService(),
+      builder: (_, __) {
+        final cs = Theme.of(context).colorScheme;
+        final l = AppLocalizations.of(context)!;
+        final dl = DownloadService();
+        final downloading = dl.isDownloading(_key);
+        final downloaded = dl.isDownloaded(_key);
+        final progress = dl.downloadProgress(_key);
+
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        final dlGreen = isDark ? Colors.greenAccent.withValues(alpha: 0.7) : Colors.green.shade700;
+
+        final IconData icon;
+        final String label;
+        final Color color;
+        if (downloaded) {
+          icon = Icons.download_done_rounded;
+          label = l.saved;
+          color = dlGreen;
+        } else if (downloading) {
+          icon = Icons.downloading_rounded;
+          label = '${(progress * 100).toStringAsFixed(0)}%';
+          color = accent;
+        } else {
+          icon = Icons.download_outlined;
+          label = l.download;
+          color = cs.onSurfaceVariant;
+        }
+
+        final h = compact ? 30.0 : (large ? 48.0 : 36.0);
+        final iconSz = compact ? 13.0 : (large ? 20.0 : 16.0);
+        final fontSize = compact ? 10.0 : (large ? 14.0 : 12.0);
+        final radius = compact ? 10.0 : (large ? 16.0 : 14.0);
+
+        return Pressable(
+          onTap: () => _handleTap(context, dl),
+          child: Container(
+            height: h,
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(
+              color: downloaded
+                  ? _buttonFill(cs, dlGreen, 0.1, 0.12)
+                  : _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(color: downloaded
+                  ? _buttonEdge(dlGreen, 0.3, 0.9)
+                  : _buttonEdge(cs.onSurface, 0.08, 0.55)),
+            ),
+            child: Stack(children: [
+              if (downloading)
+                FractionallySizedBox(
+                  widthFactor: progress.clamp(0.0, 1.0),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(radius - 1),
+                    ),
+                  ),
+                ),
+              Center(child: iconsOnly || (compact && !downloaded && !downloading)
+                ? Icon(icon, size: iconSz, color: color)
+                : Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(icon, size: iconSz, color: color),
+                      SizedBox(width: compact ? 4 : 8),
+                      Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(
+                        color: color, fontSize: fontSize,
+                        fontWeight: downloaded || downloading ? FontWeight.w700 : FontWeight.w500,
+                      ))),
+                    ],
+                  )),
+            ]),
+          ),
+        );
+      },
+    );
+  }
+
+  void _handleTap(BuildContext context, DownloadService dl) async {
+    final l = AppLocalizations.of(context)!;
+    if (dl.isDownloaded(_key)) {
+      showDialog(context: context, builder: (ctx) => AlertDialog(
+        title: Text(l.removeDownloadQuestion),
+        content: Text(l.removeDownloadContent),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(l.cancel)),
+          TextButton(onPressed: () {
+            dl.deleteDownload(_key, byUser: true);
+            Navigator.pop(ctx);
+            showOverlayToast(context, l.downloadRemoved, icon: Icons.delete_outline_rounded);
+          }, child: Text(l.remove, style: const TextStyle(color: Colors.redAccent))),
+        ],
+      ));
+    } else if (dl.isDownloading(_key)) {
+      dl.cancelDownload(_key);
+    } else {
+      final auth = context.read<AuthProvider>();
+      final api = auth.apiService;
+      if (api == null) return;
+      final error = await dl.downloadItem(api: api, itemId: _key, episodeId: episodeId, title: title, author: author, coverUrl: coverUrl, libraryId: context.read<LibraryProvider>().selectedLibraryId);
+      if (error != null && context.mounted) {
+        showOverlayToast(context, error, icon: Icons.error_outline_rounded);
+      }
+    }
+  }
+}
+
+/// Bookmark button as wide card
+class CardBookmarkButtonInline extends StatefulWidget {
+  final AudioPlayerService player;
+  final Color accent;
+  final bool isActive;
+  final String itemId;
+  final String? episodeId;
+  final bool large;
+  final bool compact;
+  final bool short;
+  final bool iconsOnly;
+  const CardBookmarkButtonInline({super.key, required this.player, required this.accent, required this.isActive, required this.itemId, this.episodeId, this.large = false, this.compact = false, this.short = false, this.iconsOnly = false});
+
+  // Podcast bookmarks are keyed 'showId-episodeId' so each episode keeps its
+  // own; books use the plain itemId.
+  String get _key => episodeKeyFor(itemId, episodeId);
+
+  @override State<CardBookmarkButtonInline> createState() => _CardBookmarkButtonInlineState();
+}
+
+class _CardBookmarkButtonInlineState extends State<CardBookmarkButtonInline> {
+  int _count = 0;
+  @override void initState() { super.initState(); _syncThenLoadCount(); }
+
+  Future<void> _syncThenLoadCount() async {
+    // Show local count immediately
+    _loadCount();
+    // Then sync with server and update. The player's api is null when no book
+    // is loaded (browsing a not-playing book), so fall back to the signed-in
+    // one - server bookmarks should appear either way. Episode bookmarks never
+    // go to the server, so there is nothing to wait for.
+    if (widget.episodeId != null) return;
+    final api = AudioPlayerService().currentApi ??
+        (mounted ? context.read<AuthProvider>().apiService : null);
+    if (api != null) {
+      await BookmarkService().syncBookmarks(widget._key, api);
+      _loadCount();
+    }
+  }
+
+  Future<void> _loadCount() async {
+    final c = await BookmarkService().getCount(widget._key);
+    if (mounted) setState(() => _count = c);
+  }
+
+  @override Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final l = AppLocalizations.of(context)!;
+    final cp = widget.compact;
+    final lg = widget.large;
+    final active = widget.isActive || _isCasting;
+    final iconSz = cp ? 13.0 : (lg ? 22.0 : 18.0);
+    final fontSize = cp ? 10.0 : (lg ? 14.0 : 12.0);
+    final vPad = cp ? 6.0 : (lg ? 12.0 : 8.0);
+    final radius = cp ? 10.0 : (lg ? 14.0 : 12.0);
+    final sh = widget.short;
+    final label = cp ? (_count > 0 ? '$_count' : l.bookmark) : sh ? l.bookmarks : (_count > 0 ? l.bookmarksWithCount(_count) : l.bookmark);
+    return Pressable(
+      onTap: () => _showBookmarks(context),
+      onLongPress: active ? () => _quickAdd(context) : null,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: vPad),
+        decoration: BoxDecoration(
+          color: _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+          borderRadius: BorderRadius.circular(radius),
+          border: Border.all(color: _buttonEdge(cs.onSurface, 0.08, 0.55)),
+        ),
+        child: cp || widget.iconsOnly
+          ? Center(child: Icon(Icons.bookmark_outline_rounded, size: iconSz, color: cs.onSurfaceVariant))
+          : Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.bookmark_outline_rounded, size: iconSz, color: cs.onSurfaceVariant),
+                const SizedBox(width: 8),
+                Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(
+                  color: cs.onSurfaceVariant, fontSize: fontSize, fontWeight: FontWeight.w500))),
+              ],
+            ),
+      ),
+    );
+  }
+
+  bool get _isCasting {
+    final cast = ChromecastService();
+    return cast.isCasting && cast.castingItemId == widget.itemId;
+  }
+
+  void _quickAdd(BuildContext ctx) async {
+    final l = AppLocalizations.of(ctx)!;
+    final cast = ChromecastService();
+    final pos = _isCasting
+        ? cast.castPosition.inMilliseconds / 1000.0
+        : widget.player.position.inMilliseconds / 1000.0;
+    final chapters = _isCasting ? cast.castingChapters : widget.player.chapters;
+    String? chTitle;
+    for (final ch in chapters) {
+      final m = ch as Map<String, dynamic>;
+      final s = (m['start'] as num?)?.toDouble() ?? 0;
+      final e = (m['end'] as num?)?.toDouble() ?? 0;
+      if (pos >= s && pos < e) { chTitle = m['title'] as String?; break; }
+    }
+    await BookmarkService().addBookmark(itemId: widget._key, positionSeconds: pos, title: chTitle ?? l.bookmark, api: AudioPlayerService().currentApi);
+    _loadCount();
+    if (ctx.mounted) {
+      showOverlayToast(ctx, l.bookmarkAdded,
+          icon: Icons.bookmark_added_rounded);
+    }
+  }
+
+  void _showBookmarks(BuildContext context) {
+    showModalBottomSheet(
+      context: context, backgroundColor: Colors.transparent, isScrollControlled: true, useSafeArea: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6, minChildSize: 0.05, snap: true, maxChildSize: 0.9, expand: false,
+        builder: (ctx, sc) => SimpleBookmarkSheet(itemId: widget.itemId, episodeId: widget.episodeId, player: widget.player, accent: widget.accent, scrollController: sc, onChanged: _loadCount),
+      ),
+    );
+  }
+}
+
+/// Speed button as wide card — opens the full speed sheet with slider
+class CardSpeedButtonInline extends StatefulWidget {
+  final AudioPlayerService player;
+  final Color accent;
+  final bool isActive;
+  final bool large;
+  final bool compact;
+  final bool iconsOnly;
+  final String? itemId;
+  const CardSpeedButtonInline({super.key, required this.player, required this.accent, required this.isActive, this.large = false, this.compact = false, this.iconsOnly = false, this.itemId});
+
+  @override State<CardSpeedButtonInline> createState() => _CardSpeedButtonInlineState();
+}
+
+class _CardSpeedButtonInlineState extends State<CardSpeedButtonInline> {
+  double _savedSpeed = 1.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedSpeed();
+    PlayerSettings.settingsChanged.addListener(_loadSavedSpeed);
+  }
+
+  @override
+  void dispose() {
+    PlayerSettings.settingsChanged.removeListener(_loadSavedSpeed);
+    super.dispose();
+  }
+
+  Future<void> _loadSavedSpeed() async {
+    if (widget.itemId == null) return;
+    final bookSpeed = await PlayerSettings.getBookSpeed(widget.itemId!);
+    final speed = bookSpeed ?? await PlayerSettings.getDefaultSpeed();
+    if (mounted && speed != _savedSpeed) setState(() => _savedSpeed = speed);
+  }
+
+  @override Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final cast = ChromecastService();
+    final h = widget.compact ? 30.0 : (widget.large ? 48.0 : 36.0);
+    final iconSz = widget.compact ? 13.0 : (widget.large ? 20.0 : 16.0);
+    final fontSize = widget.compact ? 10.0 : (widget.large ? 15.0 : 13.0);
+    final radius = widget.compact ? 10.0 : (widget.large ? 16.0 : 14.0);
+    return ListenableBuilder(
+      listenable: Listenable.merge([cast, widget.player]),
+      builder: (context, _) {
+        final castNow = widget.itemId != null && cast.isCasting && cast.castingItemId == widget.itemId;
+        final speedNow = castNow ? cast.castSpeed : (widget.isActive ? widget.player.speed : _savedSpeed);
+        final isDefaultSpeed = (speedNow - 1.0).abs() < 0.01;
+        final Widget content;
+        if (widget.compact) {
+          content = Center(child: Text('${speedNow.toStringAsFixed(1)}x', style: TextStyle(
+            color: widget.accent, fontSize: fontSize, fontWeight: FontWeight.w700)));
+        } else if (widget.iconsOnly && isDefaultSpeed) {
+          content = Center(child: Icon(Icons.speed_rounded, size: iconSz, color: cs.onSurfaceVariant));
+        } else if (widget.iconsOnly) {
+          content = Center(child: Text(speedNow.toStringAsFixed(2), style: TextStyle(
+            color: widget.accent, fontSize: fontSize, fontWeight: FontWeight.w700)));
+        } else {
+          content = Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.speed_rounded, size: iconSz, color: widget.accent),
+              const SizedBox(width: 8),
+              Text('${speedNow.toStringAsFixed(2)}x', style: TextStyle(
+                color: widget.accent, fontSize: fontSize, fontWeight: FontWeight.w700)),
+            ],
+          );
+        }
+        return Pressable(
+          onTap: () {
+            showModalBottomSheet(context: context, backgroundColor: Colors.transparent,
+              useSafeArea: true,
+              builder: (ctx) => CardSpeedSheet(player: widget.player, accent: widget.accent, itemId: widget.itemId));
+          },
+          child: Container(
+            height: h,
+            decoration: BoxDecoration(
+              color: _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(color: _buttonEdge(cs.onSurface, 0.08, 0.55)),
+            ),
+            child: content,
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ─── SPEED SHEET ─────────────────────────────────────────────
+
+class CardSpeedSheet extends StatefulWidget {
+  final AudioPlayerService player; final Color accent; final String? itemId;
+  const CardSpeedSheet({super.key, required this.player, required this.accent, this.itemId});
+  @override State<CardSpeedSheet> createState() => _CardSpeedSheetState();
+}
+
+class _CardSpeedSheetState extends State<CardSpeedSheet> {
+  late double _speed;
+  List<double> _presets = List<double>.from(PlayerSettings.defaultSpeedPresets);
+
+  bool get _isCasting {
+    final cast = ChromecastService();
+    return widget.itemId != null && cast.isCasting && cast.castingItemId == widget.itemId;
+  }
+
+  @override void initState() {
+    super.initState();
+    final initialSpeed = _isCasting ? ChromecastService().castSpeed : widget.player.speed;
+    _speed = (initialSpeed * 20).round() / 20.0;
+    if (!widget.player.hasBook && !_isCasting) _loadSavedSpeed();
+    _loadPresets();
+    PlayerSettings.settingsChanged.addListener(_loadPresets);
+  }
+
+  @override void dispose() {
+    PlayerSettings.settingsChanged.removeListener(_loadPresets);
+    super.dispose();
+  }
+
+  Future<void> _loadPresets() async {
+    final presets = await PlayerSettings.getSpeedPresets();
+    if (mounted) setState(() => _presets = presets);
+  }
+
+  Future<void> _addCurrentAsPreset() async {
+    if (_presets.any((p) => (p - _speed).abs() < 0.01)) return;
+    final next = [..._presets, _speed];
+    await PlayerSettings.setSpeedPresets(next);
+  }
+
+  Future<void> _removePreset(double value) async {
+    if (_presets.length <= 1) return;
+    final next = _presets.where((p) => (p - value).abs() >= 0.01).toList();
+    await PlayerSettings.setSpeedPresets(next);
+  }
+
+  Future<void> _loadSavedSpeed() async {
+    if (widget.itemId == null) return;
+    final bookSpeed = await PlayerSettings.getBookSpeed(widget.itemId!);
+    final speed = bookSpeed ?? await PlayerSettings.getDefaultSpeed();
+    if (mounted) setState(() => _speed = (speed * 20).round() / 20.0);
+  }
+  void _setSpeed(double v) {
+    final s = (v * 20).round() / 20.0;
+    setState(() => _speed = s.clamp(0.5, 5.0));
+    if (_isCasting) {
+      ChromecastService().setSpeed(_speed);
+    } else if (widget.player.hasBook) {
+      widget.player.setSpeed(_speed);
+    }
+    // Always save per-book speed so inactive cards pick it up
+    if (widget.itemId != null) {
+      PlayerSettings.setBookSpeed(widget.itemId!, _speed);
+      PlayerSettings.notifySettingsChanged();
+    }
+  }
+
+  @override Widget build(BuildContext context) {
+    final tt = Theme.of(context).textTheme;
+    final l = AppLocalizations.of(context)!;
+    final navBarPad = MediaQuery.of(context).viewPadding.bottom;
+    return Container(
+      padding: EdgeInsets.fromLTRB(24, 16, 24, 24 + navBarPad),
+      decoration: BoxDecoration(color: Theme.of(context).bottomSheetTheme.backgroundColor, borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: widget.accent.withValues(alpha: 0.2), width: 1))),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(width: 40, height: 4, decoration: BoxDecoration(color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.24), borderRadius: BorderRadius.circular(2))),
+        const SizedBox(height: 20),
+        Text(l.playbackSpeed, style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+        const SizedBox(height: 4),
+        Text('${_speed.toStringAsFixed(2)}x', style: tt.headlineMedium?.copyWith(fontWeight: FontWeight.w700, color: widget.accent)),
+        const SizedBox(height: 12),
+        const FeatureHint(
+          prefKey: 'hint_speed_presets',
+          message: 'Tap + to save the current speed as a preset. Long-press a chip to remove it.',
+          padding: EdgeInsets.fromLTRB(0, 0, 0, 12),
+        ),
+        Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
+          ..._presets.map((s) {
+            final a = (_speed - s).abs() < 0.01;
+            final canRemove = _presets.length > 1;
+            return GestureDetector(
+              onTap: () => _setSpeed(s),
+              onLongPress: canRemove ? () => _removePreset(s) : null,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(color: a ? widget.accent : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: a ? widget.accent : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.12))),
+                child: Text('${s}x', style: TextStyle(color: a ? Theme.of(context).colorScheme.surface : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7), fontSize: 13, fontWeight: a ? FontWeight.w700 : FontWeight.w500)),
+              ),
+            );
+          }),
+          GestureDetector(
+            onTap: _addCurrentAsPreset,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.04),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: widget.accent.withValues(alpha: 0.4), style: BorderStyle.solid),
+              ),
+              child: Icon(Icons.add_rounded, size: 16, color: widget.accent),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 16),
+        Row(children: [
+          GestureDetector(
+            onTap: () => _setSpeed(_speed - 0.05),
+            child: Container(
+              width: 36, height: 36,
+              decoration: BoxDecoration(shape: BoxShape.circle, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.08)),
+              child: Icon(Icons.remove_rounded, size: 20, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7)),
+            ),
+          ),
+          Expanded(child: AbsorbSlider(value: _speed, min: 0.5, max: 5.0, divisions: 90, activeColor: widget.accent, onChanged: _setSpeed)),
+          GestureDetector(
+            onTap: () => _setSpeed(_speed + 0.05),
+            child: Container(
+              width: 36, height: 36,
+              decoration: BoxDecoration(shape: BoxShape.circle, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.08)),
+              child: Icon(Icons.add_rounded, size: 20, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7)),
+            ),
+          ),
+        ]),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: 36), child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('0.5x', style: TextStyle(color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.3), fontSize: 11)),
+            Text('5.0x', style: TextStyle(color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.3), fontSize: 11)),
+          ],
+        )),
+      ]),
+    );
+  }
+}
+
+// ─── BOOKMARK SHEET ──────────────────────────────────────────
+
+class SimpleBookmarkSheet extends StatefulWidget {
+  final String itemId; final String? episodeId; final AudioPlayerService player; final Color accent; final ScrollController scrollController; final VoidCallback onChanged;
+  const SimpleBookmarkSheet({super.key, required this.itemId, this.episodeId, required this.player, required this.accent, required this.scrollController, required this.onChanged});
+
+  /// Storage key: 'showId-episodeId' for a podcast episode, the item id for a
+  /// book. [itemId] stays the library item for anything the server answers.
+  String get _key => episodeKeyFor(itemId, episodeId);
+  @override State<SimpleBookmarkSheet> createState() => _SimpleBookmarkSheetState();
+}
+
+class _SimpleBookmarkSheetState extends State<SimpleBookmarkSheet> {
+  List<Bookmark>? _bookmarks;
+  String _sort = 'newest';
+  bool _speedAdjustedTime = true;
+  double _savedSpeed = 1.0;
+  @override void initState() {
+    super.initState();
+    _loadSort();
+    PlayerSettings.getSpeedAdjustedTime().then((v) {
+      if (mounted && v != _speedAdjustedTime) setState(() => _speedAdjustedTime = v);
+    });
+    PlayerSettings.getBookSpeed(widget.itemId).then((s) async {
+      final speed = s ?? await PlayerSettings.getDefaultSpeed();
+      if (mounted && speed != _savedSpeed) setState(() => _savedSpeed = speed);
+    });
+  }
+
+  double get _displaySpeed {
+    if (!_speedAdjustedTime) return 1.0;
+    if (_isCasting) return ChromecastService().castSpeed;
+    return widget.player.currentItemId == widget.itemId
+        ? widget.player.speed
+        : _savedSpeed;
+  }
+  Future<void> _loadSort() async {
+    _sort = await PlayerSettings.getBookmarkSort();
+    // Show the local bookmarks first so the sheet never hangs on a slow or
+    // unreachable server (it used to await the sync before loading anything,
+    // which spun forever if the server didn't respond). Then sync in the
+    // background and refresh with whatever it pulled in. The player's api is
+    // null when this book isn't loaded - fall back to the signed-in one.
+    await _load();
+    if (widget.episodeId != null) return; // episode bookmarks stay local
+    final api = AudioPlayerService().currentApi ??
+        (mounted ? context.read<AuthProvider>().apiService : null);
+    if (api != null) {
+      try {
+        await BookmarkService()
+            .syncBookmarks(widget._key, api)
+            .timeout(const Duration(seconds: 12));
+      } catch (_) {}
+      await _load();
+    }
+  }
+  Future<void> _load() async {
+    final bm = await BookmarkService().getBookmarks(widget._key, sort: _sort);
+    if (mounted) setState(() => _bookmarks = bm);
+    widget.onChanged();
+  }
+
+  @override Widget build(BuildContext context) {
+    final tt = Theme.of(context).textTheme;
+    final cs = Theme.of(context).colorScheme;
+    final l = AppLocalizations.of(context)!;
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).bottomSheetTheme.backgroundColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: widget.accent.withValues(alpha: 0.2), width: 1)),
+      ),
+      child: Column(children: [
+        Padding(padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Container(width: 40, height: 4, decoration: BoxDecoration(color: cs.onSurface.withValues(alpha: 0.24), borderRadius: BorderRadius.circular(2)))),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: 20), child: Row(children: [
+          GestureDetector(
+            onTap: () {
+              final next = _sort == 'newest' ? 'position'
+                  : _sort == 'position' ? 'position_desc'
+                  : 'newest';
+              setState(() => _sort = next);
+              PlayerSettings.setBookmarkSort(next);
+              _load();
+            },
+            child: Tooltip(
+              message: _sort == 'newest' ? l.bookmarksSortedByNewest
+                  : _sort == 'position' ? l.bookmarksSortedByPosition
+                  : l.bookmarksSortedByPositionReversed,
+              child: Container(
+                width: 36, height: 36,
+                decoration: BoxDecoration(color: cs.onSurface.withValues(alpha: 0.06), borderRadius: BorderRadius.circular(10)),
+                child: Icon(
+                  _sort == 'newest' ? Icons.schedule_rounded
+                      : _sort == 'position' ? Icons.arrow_upward_rounded
+                      : Icons.arrow_downward_rounded,
+                  color: cs.onSurfaceVariant, size: 20,
+                ),
+              ),
+            ),
+          ),
+          const Spacer(),
+          Text(l.bookmarks, style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+          const Spacer(),
+          GestureDetector(onTap: () => _addBookmark(), child: Container(
+            width: 36, height: 36,
+            decoration: BoxDecoration(color: widget.accent.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(10)),
+            child: Icon(Icons.add_rounded, color: widget.accent, size: 20),
+          )),
+        ])),
+        const SizedBox(height: 8),
+        Expanded(child: _bookmarks == null
+            ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
+            : _bookmarks!.isEmpty
+                ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.bookmark_outline_rounded, size: 48, color: cs.onSurface.withValues(alpha: 0.1)),
+                    const SizedBox(height: 12),
+                    Text(l.noBookmarksYet, style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant)),
+                    const SizedBox(height: 4),
+                    Text(l.longPressBookmarkHint, style: tt.bodySmall?.copyWith(color: cs.onSurface.withValues(alpha: 0.24), fontSize: 11)),
+                  ]))
+                : ListView.builder(
+                    controller: widget.scrollController, padding: const EdgeInsets.only(bottom: 24), itemCount: _bookmarks!.length,
+                    itemBuilder: (ctx, i) {
+                      final bm = _bookmarks![i];
+                      final hasNote = bm.note != null && bm.note!.isNotEmpty;
+                      return InkWell(
+                        onTap: () async {
+                          final result = await showModalBottomSheet<BookmarkDetailResult>(
+                            context: ctx,
+                            isScrollControlled: true,
+                            showDragHandle: true,
+                            backgroundColor:
+                                Theme.of(ctx).bottomSheetTheme.backgroundColor,
+                            shape: const RoundedRectangleBorder(
+                              borderRadius:
+                                  BorderRadius.vertical(top: Radius.circular(24)),
+                            ),
+                            builder: (_) => BookmarkDetailSheet(
+                              itemId: widget.itemId,
+                              episodeId: widget.episodeId,
+                              bookmark: bm,
+                              api: context.read<AuthProvider>().apiService,
+                            ),
+                          );
+                          if (!ctx.mounted) return;
+                          if (result == null || result.action != 'jump') {
+                            _load(); // reflect any saved title/note/time edits
+                            return;
+                          }
+                          final position = result.position;
+                          final isActive = widget.player.currentItemId == widget.itemId &&
+                              (widget.episodeId == null ||
+                                  widget.player.currentEpisodeId == widget.episodeId);
+                          Navigator.pop(ctx); // Close bookmark sheet first
+                          if (isActive || _isCasting) {
+                            final seekDur = Duration(seconds: position.round());
+                            if (_isCasting) {
+                              ChromecastService().seekTo(seekDur);
+                            } else {
+                              await widget.player.seekTo(seekDur);
+                              if (!widget.player.isPlaying) widget.player.play();
+                            }
+                          } else {
+                            await _startPlaybackAt(position);
+                          }
+                        },
+                        onLongPress: () => _editBookmark(bm),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Icon(Icons.bookmark_rounded, size: 20, color: widget.accent),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Text(bm.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: tt.bodyMedium?.copyWith(color: cs.onSurface.withValues(alpha: 0.7))),
+                              const SizedBox(height: 2),
+                              Text(bm.formattedAt(_displaySpeed), style: tt.labelSmall?.copyWith(color: cs.onSurfaceVariant)),
+                              if (hasNote) ...[
+                                const SizedBox(height: 4),
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: cs.onSurface.withValues(alpha: 0.04),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(bm.note!, maxLines: 3, overflow: TextOverflow.ellipsis,
+                                    style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant, fontSize: 11, height: 1.4)),
+                                ),
+                              ],
+                            ])),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              key: ValueKey('bookmark-delete-${bm.id}'),
+                              tooltip: l.delete,
+                              onPressed: () => _confirmDeleteBookmark(bm),
+                              padding: const EdgeInsets.all(12),
+                              constraints: const BoxConstraints.tightFor(
+                                width: 48,
+                                height: 48,
+                              ),
+                              icon: Icon(
+                                Icons.delete_outline_rounded,
+                                size: 22,
+                                color: cs.onSurface.withValues(alpha: 0.35),
+                              ),
+                            ),
+                          ]),
+                        ),
+                      );
+                    })),
+      ]),
+    );
+  }
+
+  Future<void> _confirmDeleteBookmark(Bookmark bookmark) async {
+    final l = AppLocalizations.of(context)!;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(l.deleteBookmarkQuestion),
+        content: Text(l.bookmarksJumpShortContent(
+          bookmark.title,
+          bookmark.formattedAt(_displaySpeed),
+        )),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(l.cancel),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(l.delete, style: TextStyle(color: Colors.red.shade300)),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    await BookmarkService().deleteBookmark(
+      itemId: widget._key,
+      bookmarkId: bookmark.id,
+      api: AudioPlayerService().currentApi,
+    );
+    if (mounted) await _load();
+  }
+
+  bool get _isCasting {
+    final cast = ChromecastService();
+    return cast.isCasting && cast.castingItemId == widget.itemId;
+  }
+
+  Future<void> _startPlaybackAt(double positionSeconds) async {
+    final api = context.read<AuthProvider>().apiService;
+    if (api == null) return;
+    final lib = context.read<LibraryProvider>();
+    final player = widget.player;
+    final fullItem = await api.getLibraryItem(widget.itemId);
+    if (fullItem == null) return;
+    final media = fullItem['media'] as Map<String, dynamic>? ?? {};
+    final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+    final title = metadata['title'] as String? ?? '';
+    var author = metadata['authorName'] as String? ?? '';
+    final coverUrl = lib.getCoverUrl(widget._key);
+    var duration = (media['duration'] is num) ? (media['duration'] as num).toDouble() : 0.0;
+    var chapters = (media['chapters'] as List<dynamic>?) ?? [];
+    // A podcast bookmark belongs to one episode, so play that episode - its
+    // own duration and chapters, not the show's.
+    String? episodeTitle;
+    final epId = widget.episodeId;
+    if (epId != null) {
+      final ep = ((media['episodes'] as List<dynamic>?) ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .where((e) => e['id'] == epId)
+          .firstOrNull;
+      if (ep == null) return;
+      episodeTitle = ep['title'] as String?;
+      if (author.isEmpty) author = title; // the show stands in for the author
+      duration = (ep['duration'] as num?)?.toDouble() ??
+          ((ep['audioFile'] as Map<String, dynamic>?)?['duration'] as num?)?.toDouble() ??
+          0.0;
+      chapters = (ep['chapters'] as List<dynamic>?) ?? const [];
+    }
+    await player.playItem(
+      api: api, itemId: widget.itemId,
+      title: episodeTitle ?? title, author: author, coverUrl: coverUrl,
+      totalDuration: duration, chapters: chapters,
+      episodeId: epId, episodeTitle: episodeTitle,
+      startTime: positionSeconds, forceStartTime: true,
+      libraryId: fullItem['libraryId'] as String?,
+    );
+    AppShell.goToAbsorbingGlobal();
+  }
+
+  Future<void> _addBookmark() async {
+    final l = AppLocalizations.of(context)!;
+    final cast = ChromecastService();
+    final pos = _isCasting
+        ? cast.castPosition.inMilliseconds / 1000.0
+        : widget.player.position.inMilliseconds / 1000.0;
+
+    // Default title is the current chapter name, or a plain "Bookmark". No
+    // timestamp in the title: the stored raw time would disagree with the
+    // speed-adjusted display here, and an adjusted one would disagree with the
+    // ABS web UI, which only knows raw times.
+    final chapters = _isCasting ? cast.castingChapters : widget.player.chapters;
+    String defaultTitle = l.bookmark;
+    for (final ch in chapters) {
+      final cm = ch as Map<String, dynamic>;
+      final cs = (cm['start'] as num?)?.toDouble() ?? 0;
+      final ce = (cm['end'] as num?)?.toDouble() ?? 0;
+      if (pos >= cs && pos < ce) { defaultTitle = cm['title'] as String? ?? defaultTitle; break; }
+    }
+
+    final titleC = TextEditingController(text: defaultTitle);
+    final noteC = TextEditingController();
+    final result = await showDialog<Map<String, String>>(context: context, builder: (ctx) => AlertDialog(
+      scrollable: true,
+      title: Text(l.addBookmark),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: titleC, autofocus: true, decoration: InputDecoration(labelText: l.titleLabel, border: const OutlineInputBorder())),
+          const SizedBox(height: 12),
+          TextField(
+            controller: noteC,
+            minLines: 3,
+            maxLines: 8,
+            keyboardType: TextInputType.multiline,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: InputDecoration(labelText: l.noteOptionalLabel, border: const OutlineInputBorder(), alignLabelWithHint: true),
+          ),
+        ]),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: Text(l.cancel)),
+        FilledButton(onPressed: () => Navigator.pop(ctx, {'title': titleC.text, 'note': noteC.text}), child: Text(l.save)),
+      ],
+    ));
+    if (result != null && result['title']!.isNotEmpty) {
+      final note = result['note']?.isNotEmpty == true ? result['note'] : null;
+      await BookmarkService().addBookmark(itemId: widget._key, positionSeconds: pos, title: result['title']!, note: note, api: AudioPlayerService().currentApi);
+      _load();
+    }
+  }
+
+  Future<void> _editBookmark(Bookmark bm) async {
+    final l = AppLocalizations.of(context)!;
+    final titleC = TextEditingController(text: bm.title);
+    final noteC = TextEditingController(text: bm.note ?? '');
+    final result = await showDialog<Map<String, String>>(context: context, builder: (ctx) => AlertDialog(
+      scrollable: true,
+      title: Text(l.editBookmark),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: titleC, decoration: InputDecoration(labelText: l.titleLabel, border: const OutlineInputBorder())),
+          const SizedBox(height: 12),
+          TextField(
+            controller: noteC,
+            minLines: 4,
+            maxLines: 10,
+            keyboardType: TextInputType.multiline,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: InputDecoration(labelText: l.noteOptionalLabel, border: const OutlineInputBorder(), alignLabelWithHint: true),
+          ),
+        ]),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: Text(l.cancel)),
+        FilledButton(onPressed: () => Navigator.pop(ctx, {'title': titleC.text, 'note': noteC.text}), child: Text(l.save)),
+      ],
+    ));
+    if (result != null && result['title']!.isNotEmpty) {
+      await BookmarkService().updateBookmark(
+        itemId: widget._key, bookmarkId: bm.id,
+        title: result['title']!, note: result['note']?.isNotEmpty == true ? result['note'] : null,
+        api: AudioPlayerService().currentApi,
+      );
+      _load();
+    }
+  }
+}
+
+// ─── MORE MENU SHEET (with edit/reorder mode) ────────────────
+
+class MoreMenuSheet extends StatefulWidget {
+  final List<String> overflowIds;
+  final List<String> allIds;
+  final int visibleCount;
+  final Color accent;
+  final Widget Function(String id) buildItem;
+  final void Function(List<String>, int) onReorder;
+  // The transcript slot reads Read along on a card whose book has an epub.
+  final bool readAlongLabel;
+  const MoreMenuSheet({super.key, required this.overflowIds, required this.allIds, this.visibleCount = 4, required this.accent, required this.buildItem, required this.onReorder, this.readAlongLabel = false});
+  @override State<MoreMenuSheet> createState() => _MoreMenuSheetState();
+}
+
+class _MoreMenuSheetState extends State<MoreMenuSheet> {
+  bool _editing = false;
+  late List<String> _order;
+  late int _visibleCount;
+  bool _iconsOnly = false;
+  bool _moreInline = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _order = List.from(widget.allIds);
+    _visibleCount = widget.visibleCount;
+    _loadToggles();
+  }
+
+  void _loadToggles() async {
+    final io = await PlayerSettings.getCardIconsOnly();
+    final mi = await PlayerSettings.getCardMoreInline();
+    if (mounted) setState(() {
+      _iconsOnly = io; _moreInline = mi;
+      if (mi && !_order.contains('_more')) {
+        final insertAt = (_visibleCount >= 9 ? 8 : _visibleCount).clamp(0, _order.length);
+        _order.insert(insertAt, '_more');
+        _visibleCount = (_visibleCount < 9 ? _visibleCount + 1 : 9);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    if (_editing) return _buildEditMode(cs, tt);
+    return _buildNormalMode(cs, tt);
+  }
+
+  Widget _buildNormalMode(ColorScheme cs, TextTheme tt) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).bottomSheetTheme.backgroundColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: widget.accent.withValues(alpha: 0.2), width: 1)),
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(width: 40, height: 4, decoration: BoxDecoration(color: cs.onSurface.withValues(alpha: 0.24), borderRadius: BorderRadius.circular(2))),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: GestureDetector(
+                      onTap: () => setState(() => _editing = true),
+                      child: Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Icon(Icons.edit_rounded, size: 18, color: cs.onSurface.withValues(alpha: 0.5)),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              // Overflow actions as a responsive pill grid (matches the book
+              // menu): 3 across normally, 2 on a narrow screen or large font
+              // scale, with cell height that tracks the text scale.
+              LayoutBuilder(builder: (ctx, constraints) {
+                const gap = 10.0;
+                final textScale = MediaQuery.textScalerOf(context).scale(1.0);
+                final cols = (constraints.maxWidth < 340 || textScale >= 1.3) ? 2 : 3;
+                final cellW = (constraints.maxWidth - gap * (cols - 1)) / cols;
+                final cellH = (cols == 2 ? 72.0 : 80.0) * textScale.clamp(1.0, 1.7) + 8;
+                return Wrap(spacing: gap, runSpacing: gap, children: [
+                  for (final id in widget.overflowIds)
+                    SizedBox(width: cellW, height: cellH, child: widget.buildItem(id)),
+                ]);
+              }),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEditMode(ColorScheme cs, TextTheme tt) {
+    final l = AppLocalizations.of(context)!;
+    return Container(
+      constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.75),
+      decoration: BoxDecoration(
+        color: Theme.of(context).bottomSheetTheme.backgroundColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: widget.accent.withValues(alpha: 0.2), width: 1)),
+      ),
+      child: SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 0),
+              child: Row(children: [
+                Text(l.editLayout, style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600)),
+                const Spacer(),
+                IconButton(
+                  icon: Icon(Icons.check_rounded, color: widget.accent),
+                  onPressed: () {
+                    // Ensure _more stays in visible zone
+                    final moreIdx = _order.indexOf('_more');
+                    if (moreIdx >= 0 && moreIdx >= _visibleCount) {
+                      _order.remove('_more');
+                      final insertAt = (_visibleCount >= 9 ? 8 : _visibleCount - 1).clamp(0, _order.length);
+                      _order.insert(insertAt, '_more');
+                    }
+                    widget.onReorder(List.from(_order), _visibleCount);
+                    Navigator.pop(context);
+                  },
+                ),
+              ]),
+            ),
+            // Toggles
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+              child: Wrap(spacing: 8, runSpacing: 4, children: [
+                FilterChip(
+                  label: Text(l.cardIconsOnlyChip, style: const TextStyle(fontSize: 12)),
+                  selected: _iconsOnly,
+                  onSelected: (v) { setState(() => _iconsOnly = v); PlayerSettings.setCardIconsOnly(v); },
+                  selectedColor: widget.accent.withValues(alpha: 0.2),
+                  checkmarkColor: widget.accent,
+                  visualDensity: VisualDensity.compact,
+                ),
+                FilterChip(
+                  label: Text(l.cardMoreInGridChip, style: const TextStyle(fontSize: 12)),
+                  selected: _moreInline,
+                  onSelected: (v) {
+                    setState(() {
+                      _moreInline = v;
+                      if (v && !_order.contains('_more')) {
+                        // Insert _more as last visible slot, pushing that button to hidden if at cap
+                        final insertAt = (_visibleCount >= 9 ? 8 : _visibleCount).clamp(0, _order.length);
+                        _order.insert(insertAt, '_more');
+                        _visibleCount = (_visibleCount < 9 ? _visibleCount + 1 : 9);
+                      } else if (!v && _order.contains('_more')) {
+                        final idx = _order.indexOf('_more');
+                        _order.remove('_more');
+                        if (idx < _visibleCount) _visibleCount--;
+                        if (_visibleCount < 1) _visibleCount = 1;
+                      }
+                    });
+                    PlayerSettings.setCardMoreInline(v);
+                  },
+                  selectedColor: widget.accent.withValues(alpha: 0.2),
+                  checkmarkColor: widget.accent,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ]),
+            ),
+            const SizedBox(height: 4),
+            Flexible(
+              child: ReorderableListView.builder(
+                shrinkWrap: true,
+                buildDefaultDragHandles: false,
+                onReorderStart: (_) => HapticFeedback.mediumImpact(),
+                proxyDecorator: (child, index, animation) {
+                  return AnimatedBuilder(
+                    animation: animation,
+                    builder: (context, child) => Material(
+                      elevation: 4,
+                      borderRadius: BorderRadius.circular(12),
+                      color: cs.surfaceContainer,
+                      child: child,
+                    ),
+                    child: child,
+                  );
+                },
+                // +1 slot for the section divider, rendered as its own non-draggable item
+                // at index == _visibleCount. Giving the divider its own slot lets users drop
+                // at the top of hidden / bottom of visible without the `newIdx--` adjustment
+                // swallowing the drop zone, and keeps the section header from dragging along
+                // with the first hidden item.
+                itemCount: _order.length + 1,
+                onReorder: (oldIdx, newIdx) {
+                  // Divider is not draggable, so oldIdx should never equal _visibleCount.
+                  if (oldIdx == _visibleCount) return;
+                  if (newIdx > oldIdx) newIdx--;
+                  setState(() {
+                    // Build a combined list with a sentinel at the divider position,
+                    // simulate the move, then derive new _order and _visibleCount
+                    // from where the sentinel lands.
+                    const div = '__DIV__';
+                    final combined = <String>[];
+                    for (int i = 0; i <= _order.length; i++) {
+                      if (i == _visibleCount) combined.add(div);
+                      if (i < _order.length) combined.add(_order[i]);
+                    }
+                    final moved = combined.removeAt(oldIdx);
+                    final insertAt = newIdx.clamp(0, combined.length);
+                    combined.insert(insertAt, moved);
+
+                    final newDivIdx = combined.indexOf(div);
+                    combined.removeAt(newDivIdx);
+
+                    // Constraints: at least 1 visible, _more stays visible, cap 9 visible
+                    int newVisible = newDivIdx;
+                    if (newVisible < 1) return;
+                    if (newVisible > 9) return;
+                    if (newVisible > combined.length) newVisible = combined.length;
+                    final moreIdx = combined.indexOf('_more');
+                    if (moreIdx != -1 && moreIdx >= newVisible) return;
+
+                    _order
+                      ..clear()
+                      ..addAll(combined);
+                    _visibleCount = newVisible;
+                  });
+                },
+                itemBuilder: (context, i) {
+                  // Divider slot - rendered as its own non-draggable list item.
+                  if (i == _visibleCount) {
+                    return Padding(
+                      key: const ValueKey('__DIV__'),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                      child: Row(children: [
+                        Expanded(child: Divider(color: cs.onSurface.withValues(alpha: 0.12))),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Text(_moreInline ? l.cardLayoutHidden : l.inMenu,
+                            style: tt.labelSmall?.copyWith(color: cs.onSurface.withValues(alpha: 0.4))),
+                        ),
+                        Expanded(child: Divider(color: cs.onSurface.withValues(alpha: 0.12))),
+                      ]),
+                    );
+                  }
+
+                  final orderIdx = i < _visibleCount ? i : i - 1;
+                  final id = _order[orderIdx];
+                  final isMore = id == '_more';
+                  final def = isMore ? null : buttonDefById(id);
+                  if (def == null && !isMore) return SizedBox.shrink(key: ValueKey(id));
+
+                  final isOnCard = orderIdx < _visibleCount;
+
+                  return Padding(
+                    key: ValueKey(id),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: isOnCard ? widget.accent.withValues(alpha: 0.08) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(children: [
+                        Icon(
+                          isMore
+                              ? Icons.more_horiz_rounded
+                              : (id == 'lyrics' && widget.readAlongLabel ? Icons.auto_stories_rounded : def!.icon),
+                          size: 20,
+                          color: id == 'remove' ? Colors.red.shade300 : cs.onSurface.withValues(alpha: 0.7)),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(
+                          isMore
+                              ? l.more
+                              : (id == 'lyrics' && widget.readAlongLabel ? l.readAlong : localizedCardButtonLabel(l, def!)),
+                          style: tt.bodyMedium)),
+                        if (isOnCard)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: Text('${orderIdx + 1}', style: tt.labelSmall?.copyWith(color: widget.accent, fontWeight: FontWeight.w700)),
+                          ),
+                        ReorderableDragStartListener(
+                          index: i,
+                          child: Icon(Icons.drag_handle_rounded, size: 20, color: cs.onSurface.withValues(alpha: 0.3)),
+                        ),
+                      ]),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shared action delegate for absorbing card & expanded card
+// Eliminates duplicated button/sheet logic between the two.
+// ═══════════════════════════════════════════════════════════════
+
+class CardActionDelegate {
+  final BuildContext context;
+  final AudioPlayerService player;
+  final Map<String, dynamic> item;
+  final String itemId;
+  final String? episodeId;
+  final bool isPodcastEpisode;
+  final String title;
+  final String? author;
+  final String? coverUrl;
+  final double duration;
+  final double effectiveDuration;
+  final List<dynamic> chapters;
+  final Map<String, dynamic>? recentEpisode;
+  final bool isActive;
+  final bool isPlaybackActive;
+  final bool isCastingThis;
+  final bool speedAdjustedTime;
+  final double savedSpeed;
+  final int visibleCount;
+  final bool iconsOnly;
+  final bool moreInline;
+  final List<String> buttonOrder;
+  final VoidCallback removeFromAbsorbing;
+  final VoidCallback? onRemoveExtra;
+  final void Function(List<String>, int) onReorder;
+  final bool isEbookPdf;
+  // An epub beside the audio turns the live transcript button into Read
+  // along: the reader lights the book's own words instead of a card overlay.
+  final bool isEbookEpub;
+  final VoidCallback? onEbookTap;
+  final VoidCallback? onFindInEbookTap;
+  final VoidCallback? onReadAlongTap;
+
+  CardActionDelegate({
+    required this.context,
+    required this.player,
+    required this.item,
+    required this.itemId,
+    this.episodeId,
+    this.isPodcastEpisode = false,
+    required this.title,
+    this.author,
+    this.coverUrl,
+    required this.duration,
+    required this.effectiveDuration,
+    required this.chapters,
+    this.recentEpisode,
+    required this.isActive,
+    required this.isPlaybackActive,
+    required this.isCastingThis,
+    required this.speedAdjustedTime,
+    required this.savedSpeed,
+    required this.visibleCount,
+    this.iconsOnly = false,
+    this.moreInline = false,
+    required this.buttonOrder,
+    required this.removeFromAbsorbing,
+    this.onRemoveExtra,
+    required this.onReorder,
+    this.isEbookPdf = false,
+    this.isEbookEpub = false,
+    this.onEbookTap,
+    this.onFindInEbookTap,
+    this.onReadAlongTap,
+  });
+
+  bool get _readAlongInstead =>
+      isEbookEpub && episodeId == null && onReadAlongTap != null;
+
+  Map<String, dynamic> get _media => item['media'] as Map<String, dynamic>? ?? {};
+
+  /// A book whose audio is its EPUB's narration: Read already opens on the
+  /// sentence being heard, so Find in ebook would be the same button twice.
+  bool get _narratedEbook {
+    if (episodeId != null) return false;
+    if (NarratedBooks.contains(itemId) || _media['narration'] != null) return true;
+    // A BookOrbit card's book can arrive without its files; the narration
+    // looked up when it played or opened says so either way.
+    final api = context.read<AuthProvider>().apiService;
+    return api is BookOrbitApiService && api.knownNarrated(itemId);
+  }
+
+  /// The saved button order, less what this book has no use for.
+  List<String> get _shownOrder =>
+      _narratedEbook ? buttonOrder.where((id) => id != 'findinebook').toList() : buttonOrder;
+
+  /// Which episode the bookmark surfaces belong to. A card that knows its own
+  /// episode wins; an active podcast card falls back to what is playing.
+  String? get _bookmarkEpisodeId =>
+      episodeId ?? (isPodcastEpisode ? player.currentEpisodeId : null);
+
+  int get visibleButtonCount => visibleCount;
+
+  /// Toggle the live transcript (lyrics) overlay for whatever is loaded in
+  /// the player. Guards mirror the other transcription entry points.
+  Future<void> _toggleLyrics() async {
+    final l = AppLocalizations.of(context)!;
+    if (LyricsService.instance.isOn) {
+      LyricsService.instance.disable();
+      return;
+    }
+    if (!await PlayerSettings.getTranscriptionEnabled()) {
+      if (context.mounted) {
+        showOverlayToast(context, l.transcriptionDisabledHint,
+            icon: Icons.record_voice_over_rounded);
+      }
+      return;
+    }
+    final cardKey = episodeId != null ? '$itemId-$episodeId' : itemId;
+    if (!TranscriptionService.instance.canTranscribeBook(cardKey)) {
+      if (context.mounted) {
+        await promptDownloadForTranscription(context,
+            itemId: itemId,
+            episodeId: episodeId,
+            title: title,
+            author: author,
+            coverUrl: coverUrl);
+      }
+      return;
+    }
+    // One-time expectation setting: what this does, why to let the head
+    // start build before pressing play, and the battery cost.
+    if (!await PlayerSettings.getLyricsIntroShown()) {
+      if (!context.mounted) return;
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: const Icon(Icons.subtitles_rounded),
+          title: Text(l.lyricsMode),
+          content: Text(l.lyricsIntroBody),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(l.cancel),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(l.lyricsTurnOn),
+            ),
+          ],
+        ),
+      );
+      if (go != true) return;
+      await PlayerSettings.setLyricsIntroShown();
+    }
+    // The transcript is for THIS card's book. When something else (or
+    // nothing) is loaded, load it paused with no session - the runway builds
+    // while it sits ready, and pressing play is still the user's move.
+    if (LyricsService.playerKey() != cardKey) {
+      if (!context.mounted) return;
+      final api = context.read<AuthProvider>().apiService;
+      if (api == null) return;
+      final error = await player.playItem(
+        api: api,
+        itemId: itemId,
+        episodeId: episodeId,
+        title: title,
+        author: author ?? '',
+        coverUrl: coverUrl,
+        totalDuration: duration,
+        chapters: chapters,
+        libraryId: item['libraryId'] as String?,
+        loadOnly: true,
+      );
+      if (error != null) {
+        if (context.mounted) {
+          showOverlayToast(context, error, icon: Icons.error_outline_rounded);
+        }
+        return;
+      }
+    }
+    await LyricsService.instance.enableForCurrent();
+  }
+
+  // Predefined row groupings per button count.
+  // Labels: max 3 per row. Icons: max 4 per row (5 allowed at count=5).
+  static const _labelRows = <int, List<int>>{
+    1: [1], 2: [2], 3: [3], 4: [2, 2], 5: [2, 3],
+    6: [3, 3], 7: [2, 2, 3], 8: [2, 3, 3], 9: [3, 3, 3],
+  };
+  static const _iconRows = <int, List<int>>{
+    1: [1], 2: [2], 3: [3], 4: [4], 5: [5], 6: [3, 3],
+    7: [3, 4], 8: [4, 4], 9: [3, 3, 3],
+  };
+
+  List<Widget> buildButtonGrid(Color accent, TextTheme tt) {
+    final count = visibleButtonCount;
+    final ids = _shownOrder.take(count).toList();
+    final n = ids.length;
+    if (n == 0) return [];
+
+    final compact = false;
+    final short = iconsOnly || n >= 3;
+
+    final table = iconsOnly ? _iconRows : _labelRows;
+    final rowSizes = table[n] ?? _labelRows[n] ?? [n];
+
+    final rows = <Widget>[];
+    int offset = 0;
+    for (int r = 0; r < rowSizes.length; r++) {
+      if (r > 0) rows.add(const SizedBox(height: 6));
+      final rowLen = rowSizes[r];
+      final rowSlots = ids.sublist(offset, (offset + rowLen).clamp(0, n));
+      offset += rowLen;
+
+      Widget row = Row(children: [
+        for (int c = 0; c < rowSlots.length; c++) ...[
+          if (c > 0) const SizedBox(width: 8),
+          Expanded(child: rowSlots[c] == '_more'
+              ? _buildInlineMoreButton(accent, compact: compact, short: short)
+              : buildCardButton(rowSlots[c], accent, tt, compact: compact, short: short, iconsOnly: iconsOnly)),
+        ],
+      ]);
+
+      // Center single-button rows at 1/3 width
+      if (rowSlots.length == 1 && n == 1) {
+        row = FractionallySizedBox(widthFactor: 0.34, child: row);
+      }
+
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  Widget _buildInlineMoreButton(Color accent, {bool compact = false, bool short = false}) {
+    final cs = Theme.of(context).colorScheme;
+    final l = AppLocalizations.of(context)!;
+    final large = MediaQuery.sizeOf(context).height > 700;
+    final h = compact ? 30.0 : (large ? 48.0 : 36.0);
+    final iconSz = compact ? 13.0 : (large ? 20.0 : 16.0);
+    final fontSize = compact ? 10.0 : (large ? 13.0 : 11.0);
+    final vPad = compact ? 8.0 : (large ? 14.0 : 10.0);
+    final radius = compact ? 10.0 : (large ? 14.0 : 12.0);
+    return ListenableBuilder(
+      listenable: ChromecastService(),
+      builder: (_, __) {
+        final castActive = ChromecastService().isCasting &&
+            !buttonOrder.take(visibleCount).contains('cast');
+        final iconColor = castActive ? accent : cs.onSurfaceVariant;
+        final moreIcon = castActive ? Icons.cast_connected_rounded : Icons.more_horiz_rounded;
+        return Pressable(
+          onTap: () => showMoreMenu(accent, Theme.of(context).textTheme),
+          child: Container(
+            height: h,
+            padding: EdgeInsets.symmetric(vertical: vPad),
+            decoration: BoxDecoration(
+              color: castActive
+                  ? _buttonFill(cs, _inkAccent(accent), 0.1, 0.12)
+                  : _buttonFill(cs, cs.onSurface, 0.06, 0.03, neutral: true),
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(color: castActive
+                  ? _buttonEdge(_inkAccent(accent), 0.3, 1.0)
+                  : _buttonEdge(cs.onSurface, 0.08, 0.55)),
+            ),
+            child: iconsOnly
+              ? Center(child: Icon(moreIcon, size: iconSz, color: iconColor))
+              : Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(moreIcon, size: iconSz, color: iconColor),
+                    const SizedBox(width: 6),
+                    Flexible(child: Text(castActive ? l.casting : l.more, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: iconColor, fontSize: fontSize, fontWeight: FontWeight.w500))),
+                  ],
+                ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// True when this card's EQ is actively shaping audio:
+  /// - global EQ mode: any card glows when the single EQ is on
+  /// - per-book mode: only cards whose book has saved EQ enabled
+  Future<bool> _resolveEqHighlight(EqualizerService eq, String id) async {
+    if (!eq.perItem) return eq.enabled;
+    if (id == eq.currentItemId) return eq.enabled;
+    final snap = await eq.loadItemSnapshot(id);
+    return snap['enabled'] as bool;
+  }
+
+  Widget buildCardButton(String id, Color accent, TextTheme tt, {bool compact = false, bool short = false, bool iconsOnly = false}) {
+    final large = MediaQuery.sizeOf(context).height > 700;
+    final l = AppLocalizations.of(context)!;
+    switch (id) {
+      case 'chapters':
+        return CardWideButton(
+          icon: Icons.list_rounded, label: l.chapters,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: chapters.isNotEmpty ? () => showChapters(context, accent, tt) : _showNoChapters,
+        );
+      case 'speed':
+        return CardWideButton(
+          icon: Icons.speed_rounded, label: l.speed,
+          accent: accent, isActive: isPlaybackActive, large: large, compact: compact, iconsOnly: iconsOnly,
+          child: CardSpeedButtonInline(player: player, accent: accent, isActive: isActive, large: large, compact: compact, iconsOnly: iconsOnly, itemId: itemId),
+        );
+      case 'sleep':
+        return CardWideButton(
+          icon: Icons.nightlight_round_outlined, label: l.timer,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          child: CardSleepButtonInline(accent: accent, isActive: isPlaybackActive, large: large, compact: compact, iconsOnly: iconsOnly),
+        );
+      case 'bookmarks':
+        return CardWideButton(
+          icon: Icons.bookmark_outline_rounded, label: l.bookmarks,
+          accent: accent, isActive: isPlaybackActive, large: large, compact: compact, iconsOnly: iconsOnly,
+          child: CardBookmarkButtonInline(
+            player: player, accent: accent,
+            isActive: isActive, itemId: itemId, episodeId: _bookmarkEpisodeId,
+            large: large, compact: compact, short: short, iconsOnly: iconsOnly,
+          ),
+        );
+      case 'details':
+        return CardWideButton(
+          icon: (episodeId != null || isPodcastEpisode) ? Icons.podcasts_rounded : Icons.info_outline_rounded,
+          label: short ? l.details : ((episodeId != null || isPodcastEpisode) ? l.episodeDetailsLabel : l.bookDetailsLabel),
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => _openDetails(),
+        );
+      case 'equalizer':
+        return ListenableBuilder(
+          listenable: EqualizerService(),
+          builder: (_, __) {
+            final eq = EqualizerService();
+            return FutureBuilder<bool>(
+              future: _resolveEqHighlight(eq, itemId),
+              builder: (_, snap) {
+                final highlighted = snap.data ?? false;
+                return CardWideButton(
+                  icon: Icons.equalizer_rounded, label: compact ? l.equalizerShort : l.equalizerLabel,
+                  accent: accent, isActive: true, alwaysEnabled: true,
+                  highlighted: highlighted,
+                  large: large, compact: compact, iconsOnly: iconsOnly,
+                  onTap: () => showEqualizerSheet(context, accent, itemId: itemId, itemTitle: title),
+                );
+              },
+            );
+          },
+        );
+      case 'cast':
+        return ListenableBuilder(
+          listenable: ChromecastService(),
+          builder: (_, __) {
+            final cast = ChromecastService();
+            final String castLabel;
+            if (compact || short) {
+              castLabel = cast.isConnected ? l.casting : l.cast;
+            } else if (cast.isCasting && cast.castingItemId == itemId) {
+              castLabel = l.castingToDevice(cast.connectedDeviceName ?? 'device');
+            } else if (cast.isConnected) {
+              castLabel = l.castToDeviceNamed(cast.connectedDeviceName ?? 'device');
+            } else {
+              castLabel = l.castToDevice;
+            }
+            return CardWideButton(
+              icon: cast.isConnected ? Icons.cast_connected_rounded : Icons.cast_rounded,
+              label: castLabel, accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+              onTap: () => handleCastTap(context, accent),
+            );
+          },
+        );
+      case 'airplay':
+        return CardWideButton(
+          icon: Icons.airplay_rounded, label: 'AirPlay',
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => handleAirPlayTap(),
+        );
+      case 'history':
+        return CardWideButton(
+          icon: Icons.history_rounded, label: (compact || short) ? l.historyShort : l.playbackHistory,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => showHistory(context, accent, tt),
+        );
+      case 'remove':
+        return CardWideButton(
+          icon: Icons.remove_circle_outline_rounded, label: (compact || short) ? l.remove : Wording.of(context).removeFromAbsorbing,
+          accent: Colors.red.shade300, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () { removeFromAbsorbing(); onRemoveExtra?.call(); },
+        );
+      case 'car':
+        return CardWideButton(
+          icon: Icons.directions_car_rounded, label: l.carModeTitle,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => openCarMode(context),
+        );
+      case 'wake':
+        return ValueListenableBuilder<bool>(
+          valueListenable: PlayerScreenWake.wanted,
+          builder: (_, on, __) => CardWideButton(
+            icon: on ? Icons.lightbulb_rounded : Icons.lightbulb_outline_rounded,
+            label: l.keepScreenOn,
+            accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+            highlighted: on,
+            onTap: () => toggleKeepScreenOn(context),
+          ),
+        );
+      case 'notes':
+        return CardWideButton(
+          icon: Icons.note_rounded, label: l.notes,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => showNotes(context, accent),
+        );
+      case 'download':
+        return CardWideButton(
+          icon: Icons.download_outlined, label: l.download,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          child: CardDownloadButtonInline(
+            itemId: itemId, episodeId: episodeId,
+            title: title, author: author, coverUrl: coverUrl,
+            accent: accent, large: large, compact: compact, iconsOnly: iconsOnly,
+          ),
+        );
+      case 'ebook':
+        return CardWideButton(
+          icon: isEbookPdf ? Icons.picture_as_pdf_rounded : Icons.menu_book_rounded,
+          label: 'Read',
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          // The card handles the no-ebook case itself (it retries the item
+          // fetch before toasting).
+          onTap: () => onEbookTap?.call(),
+        );
+      case 'findinebook':
+        return CardWideButton(
+          icon: Icons.manage_search_rounded,
+          label: l.findInEbook,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          onTap: () => onFindInEbookTap?.call(),
+        );
+      case 'lyrics':
+        if (_readAlongInstead) {
+          return CardWideButton(
+            icon: Icons.auto_stories_rounded,
+            label: l.readAlong,
+            accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+            onTap: () => onReadAlongTap?.call(),
+          );
+        }
+        // Usable with nothing playing: the handler hot-loads this card's
+        // book paused so the runway can build before the user presses play.
+        return CardWideButton(
+          icon: Icons.subtitles_rounded,
+          label: l.lyricsMode,
+          accent: accent, isActive: true, alwaysEnabled: true, large: large, compact: compact, iconsOnly: iconsOnly,
+          highlighted: LyricsService.instance.isOn,
+          onTap: _toggleLyrics,
+        );
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Widget buildMoreMenuItem(String id, Color accent, TextTheme tt, BuildContext ctx) {
+    final l = AppLocalizations.of(context)!;
+    switch (id) {
+      case 'chapters':
+        return MoreMenuItem(
+          icon: Icons.list_rounded, label: l.chapters, accent: accent,
+          enabled: true,
+          onTap: () {
+            Navigator.pop(ctx);
+            if (chapters.isEmpty) { _showNoChapters(); return; }
+            showChapters(context, accent, tt);
+          },
+        );
+      case 'speed':
+        return MoreMenuItem(
+          icon: Icons.speed_rounded, label: l.speed, accent: accent,
+          enabled: true,
+          onTap: () {
+            Navigator.pop(ctx);
+            showModalBottomSheet(context: context, backgroundColor: Colors.transparent, useSafeArea: true,
+              builder: (_) => CardSpeedSheet(player: player, accent: accent, itemId: itemId));
+          },
+        );
+      case 'sleep':
+        return MoreMenuItem(
+          icon: Icons.nightlight_round_outlined, label: l.timer, accent: accent,
+          enabled: true,
+          onTap: () {
+            Navigator.pop(ctx);
+            showSleepTimerSheet(context, accent);
+          },
+        );
+      case 'bookmarks':
+        return MoreMenuItem(
+          icon: Icons.bookmark_outline_rounded, label: l.bookmarks, accent: accent,
+          enabled: isPlaybackActive,
+          onTap: () {
+            Navigator.pop(ctx);
+            showModalBottomSheet(context: context, backgroundColor: Colors.transparent, isScrollControlled: true, useSafeArea: true,
+              builder: (_) => DraggableScrollableSheet(
+                initialChildSize: 0.6, minChildSize: 0.05, snap: true, maxChildSize: 0.9, expand: false,
+                builder: (_, sc) => SimpleBookmarkSheet(itemId: itemId, episodeId: _bookmarkEpisodeId, player: player, accent: accent, scrollController: sc, onChanged: () {}),
+              ),
+            );
+          },
+        );
+      case 'details':
+        return MoreMenuItem(
+          icon: (episodeId != null || isPodcastEpisode) ? Icons.podcasts_rounded : Icons.info_outline_rounded,
+          label: (episodeId != null || isPodcastEpisode) ? l.episodeDetailsLabel : l.bookDetailsLabel,
+          accent: accent,
+          onTap: () { Navigator.pop(ctx); _openDetails(); },
+        );
+      case 'equalizer':
+        return MoreMenuItem(
+          icon: Icons.equalizer_rounded, label: l.equalizerLabel, accent: accent,
+          onTap: () { Navigator.pop(ctx); showEqualizerSheet(context, accent, itemId: itemId, itemTitle: title); },
+        );
+      case 'cast':
+        return ListenableBuilder(
+          listenable: ChromecastService(),
+          builder: (_, __) {
+            final cast = ChromecastService();
+            final String castLabel;
+            if (cast.isCasting && cast.castingItemId == itemId) {
+              castLabel = l.castingToDevice(cast.connectedDeviceName ?? 'device');
+            } else if (cast.isConnected) {
+              castLabel = l.castToDeviceNamed(cast.connectedDeviceName ?? 'device');
+            } else {
+              castLabel = l.castToDevice;
+            }
+            return MoreMenuItem(
+              icon: cast.isConnected ? Icons.cast_connected_rounded : Icons.cast_rounded,
+              label: castLabel, accent: accent,
+              onTap: () { Navigator.pop(ctx); handleCastTap(context, accent); },
+            );
+          },
+        );
+      case 'airplay':
+        return MoreMenuItem(
+          icon: Icons.airplay_rounded, label: 'AirPlay', accent: accent,
+          onTap: () { Navigator.pop(ctx); handleAirPlayTap(); },
+        );
+      case 'history':
+        return MoreMenuItem(
+          icon: Icons.history_rounded, label: l.playbackHistory, accent: accent,
+          enabled: true,
+          onTap: () { Navigator.pop(ctx); showHistory(context, accent, tt); },
+        );
+      case 'remove':
+        return MoreMenuItem(
+          icon: Icons.remove_circle_outline_rounded, label: Wording.of(context).removeFromAbsorbing,
+          accent: Colors.red.shade300,
+          onTap: () { Navigator.pop(ctx); removeFromAbsorbing(); onRemoveExtra?.call(); },
+        );
+      case 'car':
+        return MoreMenuItem(
+          icon: Icons.directions_car_rounded, label: l.carModeTitle, accent: accent,
+          onTap: () { Navigator.pop(ctx); openCarMode(context); },
+        );
+      case 'wake':
+        final wakeOn = PlayerScreenWake.wanted.value;
+        return MoreMenuItem(
+          icon: wakeOn ? Icons.lightbulb_rounded : Icons.lightbulb_outline_rounded,
+          label: wakeOn ? l.keepScreenOnActive : l.keepScreenOn,
+          accent: accent,
+          active: wakeOn,
+          onTap: () { Navigator.pop(ctx); toggleKeepScreenOn(context); },
+        );
+      case 'notes':
+        return MoreMenuItem(
+          icon: Icons.note_rounded, label: l.notes, accent: accent,
+          onTap: () { Navigator.pop(ctx); showNotes(context, accent); },
+        );
+      case 'download':
+        return ListenableBuilder(
+          listenable: DownloadService(),
+          builder: (_, __) {
+            final dl = DownloadService();
+            final dlKey = episodeId != null ? '$itemId-$episodeId' : itemId;
+            final downloaded = dl.isDownloaded(dlKey);
+            final downloading = dl.isDownloading(dlKey);
+            final progress = dl.downloadProgress(dlKey);
+            final isDark = Theme.of(context).brightness == Brightness.dark;
+            final dlGreen = isDark ? Colors.greenAccent.withValues(alpha: 0.7) : Colors.green.shade700;
+            final String dlLabel;
+            final IconData dlIcon;
+            final Color dlAccent;
+            if (downloaded) {
+              dlIcon = Icons.download_done_rounded; dlLabel = l.saved; dlAccent = dlGreen;
+            } else if (downloading) {
+              dlIcon = Icons.downloading_rounded; dlLabel = '${(progress * 100).toStringAsFixed(0)}%'; dlAccent = accent;
+            } else {
+              dlIcon = Icons.download_outlined; dlLabel = l.download; dlAccent = accent;
+            }
+            return MoreMenuItem(
+              icon: dlIcon, label: dlLabel, accent: dlAccent,
+              onTap: () {
+                Navigator.pop(ctx);
+                final dl = DownloadService();
+                if (dl.isDownloaded(dlKey)) {
+                  showDialog(context: context, builder: (dCtx) => AlertDialog(
+                    title: Text(l.removeDownloadQuestion),
+                    content: Text(l.removeDownloadContent),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dCtx), child: Text(l.cancel)),
+                      TextButton(onPressed: () {
+                        dl.deleteDownload(dlKey, byUser: true);
+                        Navigator.pop(dCtx);
+                        showOverlayToast(context, l.downloadRemoved, icon: Icons.delete_outline_rounded);
+                      }, child: Text(l.remove, style: const TextStyle(color: Colors.redAccent))),
+                    ],
+                  ));
+                } else if (dl.isDownloading(dlKey)) {
+                  dl.cancelDownload(dlKey);
+                } else {
+                  final auth = context.read<AuthProvider>();
+                  final api = auth.apiService;
+                  if (api == null) return;
+                  dl.downloadItem(api: api, itemId: dlKey, episodeId: episodeId, title: title, author: author, coverUrl: coverUrl, libraryId: context.read<LibraryProvider>().selectedLibraryId).then((error) {
+                    if (error != null && context.mounted) {
+                      showOverlayToast(context, error, icon: Icons.error_outline_rounded);
+                    }
+                  });
+                }
+              },
+            );
+          },
+        );
+      case 'ebook':
+        return MoreMenuItem(
+          icon: isEbookPdf ? Icons.picture_as_pdf_rounded : Icons.menu_book_rounded,
+          label: 'Read', accent: accent,
+          onTap: () {
+            Navigator.pop(ctx);
+            onEbookTap?.call();
+          },
+        );
+      case 'findinebook':
+        return MoreMenuItem(
+          icon: Icons.manage_search_rounded,
+          label: l.findInEbook, accent: accent,
+          onTap: () {
+            Navigator.pop(ctx);
+            onFindInEbookTap?.call();
+          },
+        );
+      case 'lyrics':
+        if (_readAlongInstead) {
+          return MoreMenuItem(
+            icon: Icons.auto_stories_rounded,
+            label: l.readAlong, accent: accent,
+            onTap: () {
+              Navigator.pop(ctx);
+              onReadAlongTap?.call();
+            },
+          );
+        }
+        return MoreMenuItem(
+          icon: Icons.subtitles_rounded,
+          label: l.lyricsMode, accent: accent,
+          onTap: () {
+            Navigator.pop(ctx);
+            _toggleLyrics();
+          },
+        );
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  void showMoreMenu(Color accent, TextTheme tt) {
+    final count = visibleButtonCount;
+    final overflowIds = _shownOrder.skip(count).where((id) => id != '_more').toList();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => MoreMenuSheet(
+        overflowIds: overflowIds,
+        allIds: buttonOrder,
+        visibleCount: count,
+        accent: accent,
+        buildItem: (id) => buildMoreMenuItem(id, accent, tt, ctx),
+        onReorder: (order, newCount) => onReorder(order, newCount),
+        readAlongLabel: _readAlongInstead,
+      ),
+    );
+  }
+
+  void showNotes(BuildContext ctx, Color accent) {
+    NotesSheet.show(ctx, itemId: itemId, itemTitle: title, accent: accent);
+  }
+
+  void openCarMode(BuildContext ctx) {
+    Navigator.of(ctx).push(MaterialPageRoute(
+      builder: (_) => CarModeScreen(
+        player: player,
+        itemId: itemId,
+        fallbackTitle: title,
+        fallbackAuthor: author,
+        fallbackCoverUrl: coverUrl,
+        fallbackDuration: effectiveDuration,
+        fallbackChapters: chapters,
+        episodeId: episodeId,
+        episodeTitle: recentEpisode?['title'] as String?,
+      ),
+    ));
+  }
+
+  /// iOS only: open the system AirPlay route picker. Routed through the native
+  /// AVRoutePickerView (see AppDelegate's com.absorb.audio_output channel).
+  static const MethodChannel _audioOutputChannel =
+      MethodChannel('com.absorb.audio_output');
+  void handleAirPlayTap() {
+    _audioOutputChannel.invokeMethod('showRoutePicker').catchError((_) => null);
+  }
+
+  void handleCastTap(BuildContext ctx, Color accent) {
+    final cast = ChromecastService();
+    final auth = ctx.read<AuthProvider>();
+    final api = auth.apiService;
+    if (cast.isCasting && cast.castingItemId == itemId) {
+      showModalBottomSheet(
+        context: ctx,
+        backgroundColor: Theme.of(ctx).bottomSheetTheme.backgroundColor,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        builder: (_) => CastControlSheet(),
+      );
+    } else if (cast.isConnected) {
+      if (api != null) {
+        cast.castItem(
+          api: api, itemId: itemId, title: title, author: author ?? '',
+          coverUrl: coverUrl, totalDuration: duration, chapters: chapters,
+          episodeId: episodeId ?? player.currentEpisodeId,
+        );
+      }
+    } else {
+      showCastDevicePicker(ctx,
+        api: api, itemId: itemId, title: title, author: author ?? '',
+        coverUrl: coverUrl, totalDuration: duration, chapters: chapters,
+        episodeId: episodeId ?? player.currentEpisodeId);
+    }
+  }
+
+  void showChapters(BuildContext ctx, Color accent, TextTheme tt) {
+    final cast = ChromecastService();
+    final chaps = isCastingThis ? cast.castingChapters : (isActive ? player.chapters : chapters);
+    if (chaps.isEmpty) return;
+    double pos = 0;
+    if (isCastingThis) {
+      pos = cast.castPosition.inMilliseconds / 1000.0;
+    } else if (isActive) {
+      pos = player.position.inMilliseconds / 1000.0;
+    } else {
+      final lib = ctx.read<LibraryProvider>();
+      final pd = episodeId != null
+          ? lib.getEpisodeProgressData(itemId, episodeId!)
+          : lib.getProgressData(itemId);
+      pos = (pd?['currentTime'] as num?)?.toDouble() ?? 0;
+    }
+    showChaptersSheet(
+      context: ctx, accent: accent, tt: tt,
+      chapters: chaps,
+      totalDuration: isCastingThis ? cast.castingDuration : (isActive ? player.totalDuration : duration),
+      currentPosition: pos,
+      isPlaybackActive: isPlaybackActive,
+      isCastingThis: isCastingThis,
+      displaySpeed: speedAdjustedTime ? (isActive ? player.speed : savedSpeed) : 1.0,
+      player: player,
+      itemId: itemId,
+    );
+  }
+
+  void _showNoChapters() {
+    final l = AppLocalizations.of(context)!;
+    showOverlayToast(
+      context,
+      episodeId != null ? l.noChaptersPodcast : l.noChaptersBook,
+      icon: Icons.list_rounded,
+    );
+  }
+
+  void showHistory(BuildContext ctx, Color accent, TextTheme tt) {
+    final historyEpisodeId = episodeId ??
+        (isPodcastEpisode ? player.currentEpisodeId : null);
+    showPlaybackHistorySheet(
+      ctx,
+      itemId: itemId,
+      episodeId: historyEpisodeId,
+      accent: accent,
+      textTheme: tt,
+      player: player,
+      isActive: isActive,
+    );
+  }
+
+  Future<void> _openDetails() async {
+    if (episodeId != null || isPodcastEpisode) {
+      final episode = await _resolveEpisode();
+      if (context.mounted) EpisodeDetailSheet.show(context, item, episode);
+    } else {
+      showBookDetailSheet(context, itemId);
+    }
+  }
+
+  Future<Map<String, dynamic>> _resolveEpisode() async {
+    final epId = episodeId ?? player.currentEpisodeId;
+    final episodes = _media['episodes'] as List<dynamic>? ?? [];
+    for (final ep in episodes) {
+      if (ep is Map<String, dynamic> && ep['id'] == epId) return ep;
+    }
+    final cachedEpisode = recentEpisode;
+    if (cachedEpisode != null &&
+        (epId == null || cachedEpisode['id'] == epId)) {
+      return cachedEpisode;
+    }
+    final api = context.read<AuthProvider>().apiService;
+    if (api != null) {
+      final fullItem = await api.getLibraryItem(itemId);
+      if (fullItem != null) {
+        final media = fullItem['media'] as Map<String, dynamic>? ?? {};
+        final eps = media['episodes'] as List<dynamic>? ?? [];
+        for (final ep in eps) {
+          if (ep is Map<String, dynamic> && ep['id'] == epId) return ep;
+        }
+      }
+    }
+    if (cachedEpisode != null) return cachedEpisode;
+    return {
+      'id': epId,
+      'title': player.currentEpisodeTitle,
+      'duration': player.totalDuration,
+    };
+  }
+}
+
+enum PlaybackHistoryTab { history, sessions }
+
+void showPlaybackHistorySheet(
+  BuildContext context, {
+  required String itemId,
+  String? episodeId,
+  PlaybackHistoryTab initialTab = PlaybackHistoryTab.history,
+  Color? accent,
+  TextTheme? textTheme,
+  AudioPlayerService? player,
+  bool? isActive,
+}) {
+  final resolvedPlayer = player ?? AudioPlayerService();
+  final resolvedIsActive = isActive ??
+      (resolvedPlayer.currentItemId == itemId &&
+          (episodeId == null ||
+              resolvedPlayer.currentEpisodeId == episodeId));
+  final theme = Theme.of(context);
+  showModalBottomSheet(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.6,
+      minChildSize: 0.05,
+      snap: true,
+      maxChildSize: 0.9,
+      builder: (_, scrollController) => _PlaybackHistoryBody(
+        itemId: itemId,
+        episodeId: episodeId,
+        api: context.read<AuthProvider>().apiService,
+        accent: accent ?? theme.colorScheme.primary,
+        tt: textTheme ?? theme.textTheme,
+        isActive: resolvedIsActive,
+        player: resolvedPlayer,
+        parentCtx: context,
+        scrollController: scrollController,
+        initialTab: initialTab,
+      ),
+    ),
+  );
+}
+
+const String _kAdvancedHistoryPrefKey = 'playback_history_advanced';
+
+class _PlaybackHistoryBody extends StatefulWidget {
+  final String itemId;
+  final String? episodeId;
+  final ApiService? api;
+  final Color accent;
+  final TextTheme tt;
+  final bool isActive;
+  final AudioPlayerService player;
+  final BuildContext parentCtx;
+  final ScrollController scrollController;
+  final PlaybackHistoryTab initialTab;
+
+  const _PlaybackHistoryBody({
+    required this.itemId,
+    this.episodeId,
+    required this.api,
+    required this.accent,
+    required this.tt,
+    required this.isActive,
+    required this.player,
+    required this.parentCtx,
+    required this.scrollController,
+    required this.initialTab,
+  });
+
+  @override
+  State<_PlaybackHistoryBody> createState() =>
+      _PlaybackHistorySheetBodyState();
+}
+
+class _PlaybackHistorySheetBodyState extends State<_PlaybackHistoryBody>
+    with SingleTickerProviderStateMixin {
+  bool _advanced = false;
+  late int _selectedTab;
+  late final TabController _tabController;
+  late final Future<List<PlaybackEvent>> _localFuture;
+  Future<List<Map<String, dynamic>>?>? _serverFuture;
+  bool _speedAdjustedTime = true;
+  double _savedSpeed = 1.0;
+
+  double get _displaySpeed {
+    if (!_speedAdjustedTime) return 1.0;
+    return widget.isActive ? widget.player.speed : _savedSpeed;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    PlayerSettings.getSpeedAdjustedTime().then((v) {
+      if (mounted && v != _speedAdjustedTime) setState(() => _speedAdjustedTime = v);
+    });
+    PlayerSettings.getBookSpeed(widget.itemId).then((s) async {
+      final speed = s ?? await PlayerSettings.getDefaultSpeed();
+      if (mounted && speed != _savedSpeed) setState(() => _savedSpeed = speed);
+    });
+    _selectedTab = widget.initialTab.index;
+    _tabController = TabController(
+      length: 2,
+      initialIndex: _selectedTab,
+      vsync: this,
+    )
+      ..addListener(_onTabChanged);
+    _localFuture = PlaybackHistoryService().getHistory(widget.itemId);
+    if (_selectedTab == PlaybackHistoryTab.sessions.index) {
+      _serverFuture = _fetchServerSessions();
+    }
+    ScopedPrefs.getBool(_kAdvancedHistoryPrefKey).then((v) {
+      if (!mounted) return;
+      setState(() => _advanced = v ?? false);
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController
+      ..removeListener(_onTabChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _onTabChanged() {
+    final selected = _tabController.index;
+    if (selected == _selectedTab) return;
+    final serverFuture = selected == 1 && _serverFuture == null
+        ? _fetchServerSessions()
+        : null;
+    setState(() {
+      _selectedTab = selected;
+      if (serverFuture != null) _serverFuture = serverFuture;
+    });
+  }
+
+  Future<List<Map<String, dynamic>>?> _fetchServerSessions() {
+    final api = widget.api;
+    if (api == null) return Future.value(null);
+    return api.getItemListeningSessions(
+      widget.itemId,
+      episodeId: widget.episodeId,
+    );
+  }
+
+  void _retryServerSessions() {
+    setState(() => _serverFuture = _fetchServerSessions());
+  }
+
+  Future<void> _toggleAdvanced() async {
+    final next = !_advanced;
+    setState(() => _advanced = next);
+    await ScopedPrefs.setBool(_kAdvancedHistoryPrefKey, next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).bottomSheetTheme.backgroundColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: widget.accent.withValues(alpha: 0.2), width: 1)),
+      ),
+      child: Column(children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Container(
+            width: 40, height: 4,
+            decoration: BoxDecoration(
+              color: cs.onSurface.withValues(alpha: 0.24),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(children: [
+            const SizedBox(width: 48),
+            Expanded(
+              child: Text(
+                l.playbackHistory,
+                textAlign: TextAlign.center,
+                style: widget.tt.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            SizedBox.square(
+              dimension: 48,
+              child: _selectedTab == 0
+                  ? IconButton(
+                      icon: Icon(
+                        Icons.delete_outline_rounded,
+                        size: 20,
+                        color: cs.onSurfaceVariant,
+                      ),
+                      onPressed: () async {
+                        await PlaybackHistoryService()
+                            .clearHistory(widget.itemId);
+                        if (context.mounted) Navigator.maybePop(context);
+                      },
+                      tooltip: l.clearHistoryTooltip,
+                    )
+                  : null,
+            ),
+          ]),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: TabBar(
+            controller: _tabController,
+            indicatorColor: widget.accent,
+            labelColor: widget.accent,
+            unselectedLabelColor: cs.onSurfaceVariant,
+            dividerColor: cs.onSurface.withValues(alpha: 0.08),
+            tabs: [
+              Tab(
+                key: const ValueKey('playback-history-local-tab'),
+                text: l.historyLocalTab,
+              ),
+              Tab(
+                key: const ValueKey('playback-history-server-tab'),
+                text: l.historyServerTab,
+              ),
+            ],
+          ),
+        ),
+        if (_selectedTab == 0) _buildLocalOptions(l, cs),
+        Expanded(
+          child: _selectedTab == 0
+              ? _buildLocalHistory(l, cs)
+              : _buildServerHistory(l, cs),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildLocalOptions(AppLocalizations l, ColorScheme cs) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+      child: Row(children: [
+        if (widget.isActive)
+          Expanded(
+            child: Text(
+              l.tapEventToJump,
+              style: widget.tt.bodySmall?.copyWith(
+                color: cs.onSurfaceVariant.withValues(alpha: 0.6),
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          )
+        else
+          const Spacer(),
+        Text(
+          '显示更多',
+          style: widget.tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+        ),
+        const SizedBox(width: 8),
+        Transform.scale(
+          scale: 0.8,
+          child: Switch(
+            value: _advanced,
+            onChanged: (_) => _toggleAdvanced(),
+            activeThumbColor: widget.accent,
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildLocalHistory(AppLocalizations l, ColorScheme cs) {
+    return FutureBuilder<List<PlaybackEvent>>(
+      future: _localFuture,
+      builder: (futureContext, snapshot) {
+        if (!snapshot.hasData) {
+          return const Center(
+            child: CircularProgressIndicator(strokeWidth: 2),
+          );
+        }
+        final all = snapshot.data!;
+        final events = _advanced
+            ? all
+            : all
+                .where((event) =>
+                    !kAdvancedHistoryEvents.contains(event.type))
+                .toList();
+        if (events.isEmpty) {
+          return Center(
+            child: Text(
+              l.noHistoryYet,
+              style: widget.tt.bodyMedium?.copyWith(
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          );
+        }
+
+        final items = <Widget>[];
+        String? lastDate;
+        for (final event in events) {
+          final eventDate = dateLabel(event.timestamp, l);
+          if (eventDate != lastDate) {
+            lastDate = eventDate;
+            items.add(_dateHeader(eventDate));
+          }
+          final positionLabel = fmtTime(event.positionSeconds / _displaySpeed);
+          final isAdvancedEvent =
+              kAdvancedHistoryEvents.contains(event.type);
+          items.add(ListTile(
+            dense: true,
+            visualDensity: const VisualDensity(vertical: -2),
+            leading: Icon(
+              historyIcon(event.type),
+              size: 18,
+              color: widget.accent.withValues(
+                alpha: isAdvancedEvent ? 0.45 : 0.7,
+              ),
+            ),
+            title: Text(
+              event.label,
+              style: widget.tt.bodySmall?.copyWith(
+                color: cs.onSurface.withValues(
+                  alpha: isAdvancedEvent ? 0.55 : 0.7,
+                ),
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text(
+              l.atPosition(positionLabel),
+              style: widget.tt.labelSmall?.copyWith(
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+            trailing: Text(
+              timeOfDay(event.timestamp, l),
+              style: widget.tt.labelSmall?.copyWith(
+                color: cs.onSurface.withValues(alpha: 0.3),
+              ),
+            ),
+            onTap: widget.isActive
+                ? () {
+                    widget.player.seekTo(
+                      Duration(seconds: event.positionSeconds.round()),
+                    );
+                    Navigator.pop(futureContext);
+                    showOverlayToast(
+                      widget.parentCtx,
+                      l.jumpedToPosition(positionLabel),
+                      icon: Icons.my_location_rounded,
+                    );
+                  }
+                : null,
+          ));
+        }
+
+        return ListView(
+          controller: widget.scrollController,
+          children: items,
+        );
+      },
+    );
+  }
+
+  Widget _buildServerHistory(AppLocalizations l, ColorScheme cs) {
+    final future = _serverFuture;
+    if (future == null) {
+      return const Center(child: CircularProgressIndicator(strokeWidth: 2));
+    }
+    return FutureBuilder<List<Map<String, dynamic>>?>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(
+            child: CircularProgressIndicator(strokeWidth: 2),
+          );
+        }
+        final sessions = snapshot.data;
+        if (snapshot.hasError || sessions == null) {
+          return _serverMessage(
+            widget.api == null
+                ? l.bookmarksNotConnected
+                : l.historyServerLoadFailed,
+            l,
+            cs,
+            showRetry: widget.api != null,
+          );
+        }
+        if (sessions.isEmpty) {
+          return _serverMessage(l.historyNoServerSessions, l, cs);
+        }
+
+        return ListView(
+          controller: widget.scrollController,
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+          children: [
+            for (final session in sessions)
+              ListeningSessionCard(
+                session: session,
+                onTap: () => _showServerSessionDetails(session),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showServerSessionDetails(
+    Map<String, dynamic> session,
+  ) async {
+    final changed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => SessionDetailsSheet(
+        session: session,
+        onJumped: () {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) Navigator.maybePop(context);
+          });
+        },
+      ),
+    );
+    if (changed == true && mounted) {
+      setState(() => _serverFuture = _fetchServerSessions());
+    }
+  }
+
+  Widget _serverMessage(
+    String message,
+    AppLocalizations l,
+    ColorScheme cs, {
+    bool showRetry = false,
+  }) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.cloud_outlined,
+              size: 36,
+              color: cs.onSurface.withValues(alpha: 0.18),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: widget.tt.bodyMedium?.copyWith(
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+            if (showRetry) ...[
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: _retryServerSessions,
+                child: Text(l.retry),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _dateHeader(String label) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Text(
+        label,
+        style: widget.tt.labelSmall?.copyWith(
+          color: widget.accent.withValues(alpha: 0.6),
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0.5,
+        ),
+      ),
+    );
+  }
+
+}

@@ -1,0 +1,252 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- REQUIRED PERMISSIONS -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <!-- Android 14+ only allows a connectedDevice foreground service to start
+         when the app also holds one of a short list of device-adjacent
+         permissions. This is the least invasive of them: install-time, no
+         user prompt, and cast discovery is mDNS multicast anyway. Needed so
+         the Cast SDK's ReconnectionService (below) can actually run. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+
+    <!-- External storage write access (Android 9 and below) -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:replace="android:maxSdkVersion"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:replace="android:maxSdkVersion"/>
+
+    <!-- In-app APK updater (GitHub flavor only; stripped from Play Store build) -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+
+    <!-- Block permissions pulled in by dependencies -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove"/>
+
+    <application android:label="@string/app_name" android:name="${applicationName}" android:icon="@mipmap/ic_launcher" android:networkSecurityConfig="@xml/network_security_config" android:largeHeap="true">
+
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask" android:theme="@style/LaunchTheme" android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" android:hardwareAccelerated="true" android:windowSoftInputMode="adjustResize">
+            <meta-data android:name="io.flutter.embedding.android.NormalTheme" android:resource="@style/NormalTheme"/>
+            <meta-data android:name="flutter_deeplinking_enabled" android:value="false"/>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- Required by audio_service: tap notification to return to app -->
+            <intent-filter>
+                <action android:name="com.ryanheise.audioservice.NOTIFICATION_CLICK"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+            <intent-filter android:label="Absorb sign-in">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="absorb" android:host="setup"/>
+            </intent-filter>
+        </activity>
+
+        <!-- OIDC callback via Chrome Custom Tab (flutter_web_auth_2) -->
+        <activity
+            android:name="com.linusu.flutter_web_auth_2.CallbackActivity"
+            android:exported="true"
+            android:taskAffinity="">
+            <!-- Audiobookshelf sign-in returns to absorb://oauth; the host keeps
+                 absorb://setup links with MainActivity. BookOrbit keeps its own
+                 scheme in a filter of its own, since a host here would apply
+                 to it too. -->
+            <intent-filter android:label="flutter_web_auth_2">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="absorb" android:host="oauth" />
+            </intent-filter>
+            <intent-filter android:label="flutter_web_auth_2">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bookorbit" />
+            </intent-filter>
+        </activity>
+
+        <!-- audio_service: background playback and media notification -->
+        <service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true" tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService"/>
+            </intent-filter>
+        </service>
+
+        <!-- Media button support (headphones, car stereo, etc.) -->
+        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true" tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON"/>
+            </intent-filter>
+        </receiver>
+
+        <meta-data android:name="flutterEmbedding" android:value="2"/>
+
+        <meta-data android:name="com.ryanheise.audioservice.NOTIFICATION_ICON" android:resource="@drawable/ic_notification"/>
+
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <meta-data
+            android:name="com.google.android.gms.car.notification.SmallIcon"
+            android:resource="@drawable/ic_notification" />
+
+        <!-- Chromecast Metadata -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.barnabas.absorb.AbsorbCastOptionsProvider" />
+
+        <!-- Send covers to AA while offline -->
+        <provider
+            android:name=".CoverContentProvider"
+            android:authorities="${applicationId}.covers"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!--Forground notification for better download-->
+        <service
+            android:name="com.dexterous.flutterlocalnotifications.ForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- background_downloader runs downloads in WorkManager's foreground
+             service. Declare its dataSync type so startForeground doesn't crash
+             on API 34+ (the library's own declaration has no type). -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
+        <!-- Keeps the Absorb process alive (out of Doze) during Chromecast
+             playback so the Dart-side listening-time sync timer isn't
+             throttled. Fixes GH #184. -->
+        <service
+            android:name=".CastForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- The Cast SDK's own session-resume service ships with no
+             foregroundServiceType, so startForeground() throws on API 34+ and
+             a background cast session that drops (e.g. an overnight WiFi
+             blip) can never auto-reconnect. Declaring the type here restores
+             the resume behavior AbsorbCastOptionsProvider already asks for
+             via setEnableReconnectionService(true). Fixes GH #338. -->
+        <service
+            android:name="com.google.android.gms.cast.framework.ReconnectionService"
+            android:foregroundServiceType="connectedDevice"
+            tools:node="merge" />
+
+        <!-- FileProvider for share_plus file sharing -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Now Playing homescreen widget (4x2) -->
+        <receiver
+            android:name=".NowPlayingWidget"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/now_playing_widget_info" />
+        </receiver>
+
+        <!-- Now Playing compact widget (4x1) -->
+        <receiver
+            android:name=".NowPlayingWidgetCompact"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/now_playing_widget_compact_info" />
+        </receiver>
+
+        <!-- Now Playing tiny cover widget (1x1) -->
+        <receiver
+            android:name=".NowPlayingWidgetTiny"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/now_playing_widget_tiny_info" />
+        </receiver>
+
+        <!-- Listening stats homescreen widget (4x2) -->
+        <receiver
+            android:name=".StatsWidget"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/stats_widget_info" />
+        </receiver>
+
+        <!-- An app update kills playback but the widgets redraw from the
+             stashed state, which still says playing - reset it on install. -->
+        <receiver
+            android:name=".PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Bridge to the AbsorbWear watch app: receives sync requests and
+             sign-out events sent from the watch over the Wearable Data Layer. -->
+        <service
+            android:name=".WearAuthListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data
+                    android:scheme="wear"
+                    android:host="*"
+                    android:pathPrefix="/absorb/auth" />
+            </intent-filter>
+        </service>
+
+        <!-- Receives play-pause / skip-back / skip-forward commands sent
+             from the AbsorbWear watch and forwards them to the audio
+             session as MediaButton broadcasts. -->
+        <service
+            android:name=".WearPlayerCommandListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data
+                    android:scheme="wear"
+                    android:host="*"
+                    android:pathPrefix="/absorb/player/cmd" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+    <queries>
+        <provider android:authorities="androidx.car.app.connection" />
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>
