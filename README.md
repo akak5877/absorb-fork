@@ -142,9 +142,19 @@ flutter build apk --release --flavor github --target-platform android-arm64
 
 The APK lands in `build/app/outputs/flutter-apk/app-github-release.apk`. Release
 signing is read from `android/key.properties` (ignored by git; point it at your
-own keystore). Before publishing a build, set your repository in
-`lib/fork_config.dart` so the in-app updater and the bug-report link target this
-fork instead of upstream.
+own keystore). The repository this fork reports to is set in
+`lib/fork_config.dart` (`akak5877/absorb-fork`); change it there if you publish
+your own build, otherwise updates and bug reports point at the wrong repo.
+
+### Publishing a release
+
+1. Tag the build: `git tag -a v1.12.1+310 -m "Absorb Fork 1.12.1"` then
+   `git push origin "v1.12.1+310"`.
+2. On GitHub: **Releases → Draft a new release**, pick that tag.
+3. Attach the APK renamed to `absorb-<version>-<build>-<abi>.apk`
+   (here: `absorb-1.12.1-310-arm64-v8a.apk`). The in-app updater matches the ABI
+   token in the file name, so the name matters — an APK named just `...-arm64.apk`
+   only works because it is the single asset in the release.
 
 The corresponding source for every published binary is this repository at the
 same tag as the release.
